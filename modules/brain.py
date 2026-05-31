@@ -5,9 +5,13 @@ Translates human instructions into sysadmin actions.
 
 import json
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger("syamadmin.brain")
+
+# Single source of truth for the model — override via CLAUDE_MODEL env var
+_AI_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
 
 SYSTEM_PROMPT = """Kamu adalah SyamAdmin, AI sysadmin agent yang mengelola server Ubuntu 22.04 VPS.
 Kamu menerima perintah dalam bahasa Indonesia atau Inggris dari admin via Telegram.
@@ -111,7 +115,7 @@ class AIBrain:
             "calls_count": 0,
             "api_status": "🟢 Active & Enabled" if self.enabled else "🔴 Disabled (Missing ANTHROPIC_API_KEY)"
         }
-        
+
         if self.last_error:
             stats["api_status"] = f"⚠️ API Error: {self.last_error}"
 
@@ -127,7 +131,7 @@ class AIBrain:
                 stats["total_output"] = row[1]
                 stats["total_tokens"] = row[0] + row[1]
                 stats["calls_count"] = row[2]
-                
+
                 # Input: $3/1M, Output: $15/1M
                 stats["cost_usd"] = (row[0] * 0.000003) + (row[1] * 0.000015)
                 # Assume $1 USD = Rp 16,300
@@ -140,8 +144,29 @@ class AIBrain:
     def _get_client(self):
         if self._client is None and self.enabled:
             import anthropic
-            self._client = anthropic.Anthropic(api_key=self.api_key)
+            # AsyncAnthropic agar tidak memblokir event loop saat memanggil API
+            self._client = anthropic.AsyncAnthropic(api_key=self.api_key)
         return self._client
+
+    def _log_usage(self, action: str, response) -> None:
+        """Log token usage jika response mengandung usage metadata."""
+        if hasattr(response, "usage") and response.usage:
+            self.log_token_usage(
+                action=action,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                model=_AI_MODEL,
+            )
+
+    @staticmethod
+    def _extract_json(text: str) -> dict:
+        """Ekstrak JSON dari response AI, termasuk dari markdown code block."""
+        text = text.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        return json.loads(text)
 
     async def process_command(
         self, user_message: str, context: str = ""
@@ -160,34 +185,17 @@ class AIBrain:
             if context:
                 prompt = f"Konteks server saat ini:\n{context}\n\nPerintah admin:\n{user_message}"
 
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = await client.messages.create(
+                model=_AI_MODEL,
                 max_tokens=1024,
                 system=SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": prompt}],
             )
 
-            # Clear last error on successful call
             self.last_error = None
+            self._log_usage(f"command: {user_message[:150]}", response)
 
-            # Capture usage metrics
-            if hasattr(response, 'usage') and response.usage:
-                self.log_token_usage(
-                    action=f"command: {user_message}",
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    model="claude-sonnet-4-20250514"
-                )
-
-            text = response.content[0].text.strip()
-
-            # Extract JSON from response
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-
-            result = json.loads(text)
+            result = self._extract_json(response.content[0].text)
             logger.info(f"AI parsed: intent={result.get('intent')}, module={result.get('module')}, action={result.get('action')}")
             return result
 
@@ -263,8 +271,8 @@ class AIBrain:
 
         try:
             client = self._get_client()
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = await client.messages.create(
+                model=_AI_MODEL,
                 max_tokens=1024,
                 messages=[{
                     "role": "user",
@@ -278,16 +286,7 @@ class AIBrain:
             )
 
             self.last_error = None
-
-            # Capture usage metrics for log analysis
-            if hasattr(response, 'usage') and response.usage:
-                self.log_token_usage(
-                    action="analyze_logs",
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    model="claude-sonnet-4-20250514"
-                )
-
+            self._log_usage("analyze_logs", response)
             return response.content[0].text
         except Exception as e:
             self.last_error = str(e)
@@ -311,8 +310,8 @@ class AIBrain:
                 f"Log dari layanan tersebut:\n"
                 f"```\n{log_content[:2500]}\n```"
             )
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = await client.messages.create(
+                model=_AI_MODEL,
                 max_tokens=1024,
                 system=(
                     "Kamu adalah SyamAdmin, agen AI sysadmin. Tugas kamu adalah mendiagnosis log dari layanan yang mengalami crash dan menyusun usulan perintah perbaikan otomatis (Auto-Repair) yang AMAN.\n"
@@ -329,21 +328,8 @@ class AIBrain:
             )
 
             self.last_error = None
-            if hasattr(response, 'usage') and response.usage:
-                self.log_token_usage(
-                    action=f"diagnose_crash: {service}",
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    model="claude-sonnet-4-20250514"
-                )
-
-            text = response.content[0].text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-
-            return json.loads(text)
+            self._log_usage(f"diagnose_crash: {service}", response)
+            return self._extract_json(response.content[0].text)
         except Exception as e:
             self.last_error = str(e)
             logger.warning(f"Failed to diagnose crash: {e}")
@@ -363,8 +349,8 @@ class AIBrain:
 
         try:
             client = self._get_client()
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = await client.messages.create(
+                model=_AI_MODEL,
                 max_tokens=1024,
                 system=(
                     "Kamu adalah SyamAdmin, agen AI sysadmin. Tugas kamu adalah menerjemahkan permintaan penjadwalan bahasa alami admin menjadi ekspresi cron standar Linux.\n"
@@ -387,21 +373,8 @@ class AIBrain:
             )
 
             self.last_error = None
-            if hasattr(response, 'usage') and response.usage:
-                self.log_token_usage(
-                    action=f"parse_cron: {instruction[:50]}",
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    model="claude-sonnet-4-20250514"
-                )
-
-            text = response.content[0].text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-
-            return json.loads(text)
+            self._log_usage(f"parse_cron: {instruction[:50]}", response)
+            return self._extract_json(response.content[0].text)
         except Exception as e:
             self.last_error = str(e)
             return fallback_res
@@ -420,8 +393,8 @@ class AIBrain:
 
         try:
             client = self._get_client()
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = await client.messages.create(
+                model=_AI_MODEL,
                 max_tokens=1536,
                 system=(
                     "Kamu adalah SyamAdmin, agen AI sysadmin. Tugas kamu adalah menganalisis ringkasan tren utilitas server (CPU, RAM, Disk, Swap) dan memberikan usulan optimasi sistem (Nginx, MySQL, Swap, PHP-FPM) yang paling cocok.\n"
@@ -439,21 +412,8 @@ class AIBrain:
             )
 
             self.last_error = None
-            if hasattr(response, 'usage') and response.usage:
-                self.log_token_usage(
-                    action="generate_optimization",
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    model="claude-sonnet-4-20250514"
-                )
-
-            text = response.content[0].text.strip()
-            if "```json" in text:
-                text = text.split("```json")[1].split("```")[0].strip()
-            elif "```" in text:
-                text = text.split("```")[1].split("```")[0].strip()
-
-            return json.loads(text)
+            self._log_usage("generate_optimization", response)
+            return self._extract_json(response.content[0].text)
         except Exception as e:
             self.last_error = str(e)
             return fallback_res
@@ -465,8 +425,8 @@ class AIBrain:
 
         try:
             client = self._get_client()
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
+            response = await client.messages.create(
+                model=_AI_MODEL,
                 max_tokens=1536,
                 messages=[{
                     "role": "user",
@@ -481,14 +441,7 @@ class AIBrain:
             )
 
             self.last_error = None
-            if hasattr(response, 'usage') and response.usage:
-                self.log_token_usage(
-                    action="analyze_security_threats",
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    model="claude-sonnet-4-20250514"
-                )
-
+            self._log_usage("analyze_security_threats", response)
             return response.content[0].text
         except Exception as e:
             self.last_error = str(e)

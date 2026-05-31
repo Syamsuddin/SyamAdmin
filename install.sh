@@ -129,9 +129,9 @@ RestartSec=10
 StandardOutput=append:/var/log/syamadmin/agent.log
 StandardError=append:/var/log/syamadmin/agent.log
 
-# Security hardening for the service itself
+# Service berjalan sebagai root dan perlu akses penuh ke /root (misal .my.cnf)
 NoNewPrivileges=false
-ProtectHome=read-only
+ProtectHome=no
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env & secrets
+config.env
+*.env
+
+# SQLite
+*.db
+
+# Packaging artifacts
+*.tar.gz
+
+# OS
+.DS_Store

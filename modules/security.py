@@ -69,7 +69,7 @@ AllowTcpForwarding no
         else:
             msg = f"❌ SSH config test gagal:\n```\n{test['stderr'][:500]}\n```"
 
-        await self.notifier.send(msg)
+        # Hasil dikembalikan ke pemanggil (bot) untuk ditampilkan — tidak duplikat via notifier
         return msg
 
     async def setup_fail2ban(self) -> str:
@@ -127,12 +127,11 @@ port = http,https
             "• Bot search: enabled\n"
             "• Rate limit: enabled"
         )
-        await self.notifier.send(msg)
+        # Hasil dikembalikan ke pemanggil (bot) untuk ditampilkan — tidak duplikat via notifier
         return msg
 
     async def audit(self) -> str:
         """Run a comprehensive security audit."""
-        await self.notifier.send("🔍 *Running security audit...*")
         findings = []
 
         # Check SSH config
@@ -209,7 +208,7 @@ port = http,https
         findings.append(f"👤 Recent logins:\n```\n{r['stdout']}\n```")
 
         report = "🔍 *Security Audit Report*\n\n" + "\n".join(findings)
-        await self.notifier.send(report)
+        # Hasil dikembalikan ke pemanggil (bot) untuk ditampilkan — tidak duplikat via notifier
         return report
 
     async def check_updates(self) -> str:

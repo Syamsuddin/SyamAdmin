@@ -324,7 +324,16 @@ class SyamAdminBot:
             "fail2ban": "/var/log/fail2ban.log",
         }
 
-        log_path = log_map.get(service, f"/var/log/{service}.log")
+        # Hanya izinkan service yang ada di whitelist untuk mencegah path traversal
+        if service not in log_map:
+            await update.message.reply_text(
+                f"❌ Service tidak dikenal: `{service}`\n\n"
+                f"Service yang tersedia: `nginx`, `mysql`, `auth`, `syslog`, `fail2ban`",
+                parse_mode="Markdown",
+            )
+            return
+
+        log_path = log_map[service]
         r = await self.modules["executor"].run(
             f"tail -30 {log_path} 2>/dev/null || echo 'Log file not found: {log_path}'",
             module="bot",
@@ -485,6 +494,15 @@ class SyamAdminBot:
         # 1. Check if user is currently inside the interactive site wizard
         wizard = self._wizard_states.get(self.admin_id)
         if wizard:
+            # Hapus wizard yang sudah kadaluarsa
+            if wizard.get("expires", 0) < datetime.now().timestamp():
+                del self._wizard_states[self.admin_id]
+                await update.message.reply_text(
+                    "⏰ Sesi wizard telah berakhir (timeout 10 menit). "
+                    "Mulai ulang dengan `/site wizard`.",
+                    parse_mode="Markdown",
+                )
+                return
             user_text = update.message.text.strip()
             state = wizard["state"]
 
@@ -674,8 +692,12 @@ class SyamAdminBot:
         """Initiate the step-by-step interactive site setup wizard."""
         if not await self._guard(update):
             return
-        
-        self._wizard_states[self.admin_id] = {"state": "DOMAIN"}
+
+        _WIZARD_TIMEOUT = 600  # 10 menit
+        self._wizard_states[self.admin_id] = {
+            "state": "DOMAIN",
+            "expires": datetime.now().timestamp() + _WIZARD_TIMEOUT,
+        }
         await update.message.reply_text(
             "🧙‍♂️ *Interactive Site Provisioning Wizard*\n\n"
             "Mari siapkan website baru Anda langkah demi langkah.\n\n"

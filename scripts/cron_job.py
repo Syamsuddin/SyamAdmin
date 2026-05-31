@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 
 # Ensure we can load modules from workspace
 sys.path.insert(0, "/opt/syamadmin")
-sys.path.insert(0, "/Users/syams/PROJECTS/SyamAdmin")
 
 from modules.executor import CommandExecutor
 from modules.notifier import Notifier

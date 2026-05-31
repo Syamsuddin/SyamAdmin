@@ -5,6 +5,7 @@ Every command executed by SyamAdmin is logged and sandboxed.
 
 import asyncio
 import logging
+import os
 import sqlite3
 import shlex
 import re

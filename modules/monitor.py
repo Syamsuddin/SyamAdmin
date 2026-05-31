@@ -154,54 +154,59 @@ class SystemMonitor:
                 f"(threshold: {self.thresholds['load']})"
             )
 
-    async def _check_services(self):
-        """Alert if any managed service is down with proactive AI troubleshooting."""
-        for svc in MANAGED_SERVICES:
-            result = await self.executor.run(
-                f"systemctl is-active {svc} 2>/dev/null",
+    async def _check_single_service(self, svc: str):
+        """Periksa satu service dan kirim alert jika down."""
+        result = await self.executor.run(
+            f"systemctl is-active {svc} 2>/dev/null",
+            module="monitor", check=False,
+        )
+        status_text = result["stdout"].strip()
+        if status_text not in ("active", ""):
+            # Pastikan service memang terdaftar di sistem
+            exists = await self.executor.run(
+                f"systemctl list-unit-files {svc}.service | grep -c {svc}",
                 module="monitor", check=False,
             )
-            status_text = result["stdout"].strip()
-            if status_text not in ("active", ""):
-                # Check if the service exists first
-                exists = await self.executor.run(
-                    f"systemctl list-unit-files {svc}.service | grep -c {svc}",
-                    module="monitor", check=False,
+            if exists["stdout"].strip() != "0":
+                log_paths = {
+                    "nginx": "/var/log/nginx/error.log",
+                    "mysql": "/var/log/mysql/error.log",
+                    "fail2ban": "/var/log/fail2ban.log",
+                }
+                path = log_paths.get(svc, f"/var/log/{svc}.log")
+                log_res = await self.executor.run(
+                    f"tail -n 25 {path} 2>/dev/null || journalctl -u {svc} -n 25 --no-pager",
+                    module="monitor", check=False
                 )
-                if exists["stdout"].strip() != "0":
-                    # Get recent log content for this service
-                    log_paths = {
-                        "nginx": "/var/log/nginx/error.log",
-                        "mysql": "/var/log/mysql/error.log",
-                        "fail2ban": "/var/log/fail2ban.log",
-                    }
-                    path = log_paths.get(svc, f"/var/log/{svc}.log")
-                    log_res = await self.executor.run(
-                        f"tail -n 25 {path} 2>/dev/null || journalctl -u {svc} -n 25 --no-pager",
-                        module="monitor", check=False
+                log_content = log_res["stdout"].strip() or "No recent logs found."
+
+                diagnose_msg = ""
+                if self.brain and self.brain.enabled:
+                    diag = await self.brain.diagnose_crash(svc, log_content)
+                    diagnose_msg = (
+                        f"\n\n🧠 *Analisis Masalah (AI)*:\n"
+                        f"• *Penyebab*: {diag.get('cause')}\n"
+                        f"• *Solusi*: {diag.get('solution')}\n"
+                        f"• *Risiko*: {diag.get('risk')}\n\n"
+                        f"👉 Kirim perintah `/ai perbaiki {svc}` untuk memicu perbaikan otomatis via AI."
                     )
-                    log_content = log_res["stdout"].strip() or "No recent logs found."
-                    
-                    diagnose_msg = ""
-                    if self.brain and self.brain.enabled:
-                        diag = await self.brain.diagnose_crash(svc, log_content)
-                        diagnose_msg = (
-                            f"\n\n🧠 *Analisis Masalah (AI)*:\n"
-                            f"• *Penyebab*: {diag.get('cause')}\n"
-                            f"• *Solusi*: {diag.get('solution')}\n"
-                            f"• *Risiko*: {diag.get('risk')}\n\n"
-                            f"👉 Kirim perintah `/ai perbaiki {svc}` untuk memicu perbaikan otomatis via AI."
-                        )
-                    else:
-                        diagnose_msg = f"\n\nJalankan `/ai restart {svc}` untuk mencoba menyalakan kembali."
-                        
-                    await self.notifier.alert(
-                        "critical", "monitor",
-                        f"🚨 *Layanan DOWN: {svc}*!\n"
-                        f"Status: `{status_text}`"
-                        f"{diagnose_msg}",
-                        cooldown=True,
-                    )
+                else:
+                    diagnose_msg = f"\n\nJalankan `/ai restart {svc}` untuk mencoba menyalakan kembali."
+
+                await self.notifier.alert(
+                    "critical", "monitor",
+                    f"🚨 *Layanan DOWN: {svc}*!\n"
+                    f"Status: `{status_text}`"
+                    f"{diagnose_msg}",
+                    cooldown=True,
+                )
+
+    async def _check_services(self):
+        """Alert if any managed service is down — semua service dicek secara paralel."""
+        await asyncio.gather(
+            *[self._check_single_service(svc) for svc in MANAGED_SERVICES],
+            return_exceptions=True,
+        )
 
     async def _store_metrics(self, metrics: dict):
         """Store metrics in database for trend analysis."""
