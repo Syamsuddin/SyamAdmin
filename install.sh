@@ -5,6 +5,13 @@
 # ============================================================
 set -euo pipefail
 
+# Locale C.UTF-8 selalu tersedia di Ubuntu — membungkam warning
+# "perl: Setting locale failed" yang umum di image clean/minimal.
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+# Hindari prompt interaktif di seluruh proses instalasi.
+export DEBIAN_FRONTEND=noninteractive
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -44,7 +51,10 @@ check_os() {
         echo
         [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
     fi
-    log_info "OS: $(lsb_release -ds)"
+    # Pakai /etc/os-release (selalu ada) — lsb_release sering absen di image minimal.
+    local os_name="Ubuntu (tak terdeteksi)"
+    [[ -r /etc/os-release ]] && os_name="$(. /etc/os-release && echo "${PRETTY_NAME:-$NAME}")"
+    log_info "OS: ${os_name}"
 }
 
 install_system_deps() {
