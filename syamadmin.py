@@ -71,7 +71,7 @@ async def main():
         bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
         admin_id=int(os.environ["TELEGRAM_ADMIN_ID"]),
     )
-    brain = AIBrain(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+    brain = AIBrain(api_key=os.environ.get("ANTHROPIC_API_KEY", ""), db_path=db_path)
     monitor = SystemMonitor(
         notifier=notifier,
         executor=executor,
@@ -83,6 +83,7 @@ async def main():
             "disk": float(os.environ.get("ALERT_THRESHOLD_DISK", 85)),
             "load": float(os.environ.get("ALERT_THRESHOLD_LOAD", 4.0)),
         },
+        brain=brain,
     )
     provisioner = Provisioner(executor=executor, notifier=notifier)
     security = SecurityManager(executor=executor, notifier=notifier)

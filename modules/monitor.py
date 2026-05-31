@@ -19,7 +19,7 @@ MANAGED_SERVICES = ["nginx", "mysql", "php8.3-fpm", "fail2ban", "ufw", "ssh"]
 class SystemMonitor:
     """Continuous system monitoring with threshold alerts."""
 
-    def __init__(self, notifier, executor, db_path: str, interval: int = 60, thresholds: dict = None):
+    def __init__(self, notifier, executor, db_path: str, interval: int = 60, thresholds: dict = None, brain=None):
         self.notifier = notifier
         self.executor = executor
         self.db_path = db_path
@@ -28,6 +28,7 @@ class SystemMonitor:
             "cpu": 85, "ram": 90, "disk": 85, "load": 4.0
         }
         self._running = False
+        self.brain = brain
 
     async def run_loop(self):
         """Main monitoring loop."""
@@ -154,24 +155,51 @@ class SystemMonitor:
             )
 
     async def _check_services(self):
-        """Alert if any managed service is down."""
+        """Alert if any managed service is down with proactive AI troubleshooting."""
         for svc in MANAGED_SERVICES:
             result = await self.executor.run(
                 f"systemctl is-active {svc} 2>/dev/null",
                 module="monitor", check=False,
             )
-            if result["stdout"].strip() not in ("active", ""):
+            status_text = result["stdout"].strip()
+            if status_text not in ("active", ""):
                 # Check if the service exists first
                 exists = await self.executor.run(
                     f"systemctl list-unit-files {svc}.service | grep -c {svc}",
                     module="monitor", check=False,
                 )
                 if exists["stdout"].strip() != "0":
+                    # Get recent log content for this service
+                    log_paths = {
+                        "nginx": "/var/log/nginx/error.log",
+                        "mysql": "/var/log/mysql/error.log",
+                        "fail2ban": "/var/log/fail2ban.log",
+                    }
+                    path = log_paths.get(svc, f"/var/log/{svc}.log")
+                    log_res = await self.executor.run(
+                        f"tail -n 25 {path} 2>/dev/null || journalctl -u {svc} -n 25 --no-pager",
+                        module="monitor", check=False
+                    )
+                    log_content = log_res["stdout"].strip() or "No recent logs found."
+                    
+                    diagnose_msg = ""
+                    if self.brain and self.brain.enabled:
+                        diag = await self.brain.diagnose_crash(svc, log_content)
+                        diagnose_msg = (
+                            f"\n\n🧠 *Analisis Masalah (AI)*:\n"
+                            f"• *Penyebab*: {diag.get('cause')}\n"
+                            f"• *Solusi*: {diag.get('solution')}\n"
+                            f"• *Risiko*: {diag.get('risk')}\n\n"
+                            f"👉 Kirim perintah `/ai perbaiki {svc}` untuk memicu perbaikan otomatis via AI."
+                        )
+                    else:
+                        diagnose_msg = f"\n\nJalankan `/ai restart {svc}` untuk mencoba menyalakan kembali."
+                        
                     await self.notifier.alert(
                         "critical", "monitor",
-                        f"Service *{svc}* is DOWN!\n"
-                        f"Status: `{result['stdout'].strip()}`\n"
-                        f"Jalankan `/ai restart {svc}` untuk restart.",
+                        f"🚨 *Layanan DOWN: {svc}*!\n"
+                        f"Status: `{status_text}`"
+                        f"{diagnose_msg}",
                         cooldown=True,
                     )
 
@@ -194,3 +222,42 @@ class SystemMonitor:
         filled = int(width * percent / 100)
         bar = "█" * filled + "░" * (width - filled)
         return f"`[{bar}]`"
+
+    async def get_historical_summary(self, days: int = 7) -> str:
+        """Fetch and aggregate metrics from database over the last N days."""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(self.db_path)
+            # Fetch average and peak CPU, RAM, Disk, Load
+            cur = conn.execute("""
+                SELECT 
+                    metric_type, 
+                    AVG(value) as avg_val, 
+                    MAX(value) as max_val 
+                FROM metrics 
+                WHERE timestamp >= datetime('now', ?) 
+                GROUP BY metric_type
+            """, (f"-{days} days",))
+            rows = cur.fetchall()
+            conn.close()
+            
+            if not rows:
+                return "Belum ada data historis terkumpul."
+                
+            summary = [f"📊 *Summary Penggunaan {days} Hari Terakhir:*"]
+            for r in rows:
+                metric_type, avg_val, max_val = r
+                name_map = {
+                    "cpu_percent": "CPU Usage",
+                    "ram_percent": "Memory (RAM) Usage",
+                    "disk_percent": "Disk Space Usage",
+                    "load_1": "Load Average (1m)"
+                }
+                name = name_map.get(metric_type, metric_type)
+                unit = "%" if "percent" in metric_type else ""
+                summary.append(f"• *{name}*: Rata-rata `{avg_val:.1f}{unit}`, Puncak `{max_val:.1f}{unit}`")
+                
+            return "\n".join(summary)
+        except Exception as e:
+            logger.warning(f"Failed to fetch historical trends: {e}")
+            return f"Error mengambil data tren: {e}"
