@@ -20,6 +20,39 @@ from telegram.ext import (
 
 logger = logging.getLogger("syamadmin.bot")
 
+# Peta alias: nama-aksi-yang-diajarkan-ke-AI -> nama-method-nyata di modul.
+# Mencegah kegagalan diam-diam saat AI memakai nama ramah yang berbeda dari method.
+ACTION_ALIASES = {
+    "monitor": {
+        "status": "get_status_report",
+        "services": "get_services_status",
+        "disk_usage": "get_disk_report",
+        "top_processes": "get_top_processes",
+        "connections": "get_connections",
+    },
+    "firewall": {
+        "reset": "setup_defaults",
+    },
+    "site_manager": {
+        "disable_site": "disable_site",
+    },
+    "provisioner": {
+        "setup_composer": "setup_composer",
+    },
+    "backup": {
+        "restore": "restore",
+    },
+}
+
+# Kata afirmatif yang diterima sebagai konfirmasi untuk aksi non-destruktif
+AFFIRMATIVE_WORDS = {"ya", "iya", "ok", "oke", "yes", "y", "lanjut", "setuju", "gas"}
+
+# Aksi destruktif yang WAJIB menggunakan OTP (kata afirmatif tidak cukup)
+DESTRUCTIVE_ACTIONS = {
+    "provision", "remove_site", "deny_ssh", "change_ssh_port",
+    "restore", "repair_service", "wizard_provision",
+}
+
 HELP_TEXT = """
 🤖 *SyamAdmin — AI Sysadmin Agent*
 
@@ -27,6 +60,7 @@ HELP_TEXT = """
 `/status` — Status server (CPU, RAM, Disk)
 `/services` — Status semua managed services
 `/provision` — Setup LEMP stack dari awal
+`/setup` — Panduan setup server (pemula)
 `/logs [service]` — Lihat log terbaru
 
 *Site Management:*
@@ -42,10 +76,11 @@ HELP_TEXT = """
 `/fw allow 3306` — Buka port
 `/fw deny 3306` — Tutup port
 
-*Backup:*
+*Backup & Restore:*
 `/backup` — Full backup (DB + files)
 `/backup db` — Backup databases saja
 `/backup list` — List backup tersedia
+`/restore <file>` — Restore dari backup (OTP)
 
 *AI Commands:*
 `/ai [perintah bebas]` — Perintah natural language
@@ -94,11 +129,19 @@ class SyamAdminBot:
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
+        # Deteksi server baru dan tawarkan onboarding
+        setup_hint = ""
+        try:
+            state = await self.modules["monitor"].get_state_context()
+            if "BELUM terpasang" in state:
+                setup_hint = "\n\n🆕 Server baru terdeteksi! Ketik `/setup` untuk panduan langkah demi langkah."
+        except Exception:
+            pass
         await update.message.reply_text(
             f"🤖 *SyamAdmin Agent*\n\n"
             f"Server: `{self.server_name}`\n"
             f"Status: 🟢 Online\n\n"
-            f"Kirim /help untuk daftar perintah.",
+            f"Kirim /help untuk daftar perintah.{setup_hint}",
             parse_mode="Markdown",
         )
 
@@ -199,6 +242,7 @@ class SyamAdminBot:
             domain = args[1]
             await update.message.reply_text(f"🔒 Setting up SSL for `{domain}`...", parse_mode="Markdown")
             result = await sm.enable_ssl(domain)
+            result = await self._augment_failure("aktivasi SSL", result)
             await update.message.reply_text(result, parse_mode="Markdown")
 
         elif action == "remove" and len(args) >= 2:
@@ -310,6 +354,33 @@ class SyamAdminBot:
 
         await update.message.reply_text(result, parse_mode="Markdown")
 
+    async def cmd_restore(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Restore dari file backup dengan OTP confirmation."""
+        if not await self._guard(update):
+            return
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "Penggunaan: `/restore <nama_file>`\nLihat daftar: `/backup list`",
+                parse_mode="Markdown",
+            )
+            return
+        filename = args[0]
+        otp = self._generate_otp()
+        await update.message.reply_text(
+            f"⚠️ *Konfirmasi Restore* (DESTRUKTIF!)\n\n"
+            f"File: `{filename}`\n"
+            f"Data saat ini akan ditimpa oleh isi backup.\n\n"
+            f"Kirim `/confirm {otp}` atau balas `{otp}` untuk melanjutkan.",
+            parse_mode="Markdown",
+        )
+        self._pending_confirmations[self.admin_id] = {
+            "action": "restore",
+            "filename": filename,
+            "otp": otp,
+            "expires": datetime.now().timestamp() + 120,
+        }
+
     async def cmd_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
@@ -415,12 +486,13 @@ class SyamAdminBot:
 
         msg = await update.message.reply_text("🧠 Processing...")
 
-        # Get current server context for AI
+        # Get current server context for AI (metrics + state)
         metrics = await self.modules["monitor"].collect_metrics()
+        state = await self.modules["monitor"].get_state_context()
         context_str = (
             f"CPU: {metrics['cpu_percent']}%, RAM: {metrics['ram_percent']}%, "
             f"Disk: {metrics['disk_percent']}%, Load: {metrics['load_1']}, "
-            f"Uptime: {metrics['uptime_str']}"
+            f"Uptime: {metrics['uptime_str']}\n{state}"
         )
 
         # Process through AI Brain
@@ -458,6 +530,9 @@ class SyamAdminBot:
         action = parsed.get("action", "")
         params = parsed.get("params", {})
 
+        # Resolusi alias: terjemahkan nama-aksi-AI -> method nyata
+        action = ACTION_ALIASES.get(module_name, {}).get(action, action)
+
         try:
             module = self.modules.get(module_name)
             if not module:
@@ -469,7 +544,7 @@ class SyamAdminBot:
                 result = await method(**params) if params else await method()
                 return result if isinstance(result, str) else str(result)
 
-            # Special cases
+            # Special cases (executor)
             if module_name == "executor" and action == "service_restart":
                 svc = params.get("service", "")
                 r = await self.modules["executor"].service_action(svc, "restart")
@@ -480,7 +555,12 @@ class SyamAdminBot:
                 r = await self.modules["executor"].run(cmd, module="ai_command")
                 return f"```\n{r['stdout'][:3000]}\n```" if r["success"] else f"❌ Error:\n```\n{r['stderr'][:1000]}\n```"
 
-            return parsed.get("message", f"Aksi `{action}` pada modul `{module_name}` belum diimplementasi.")
+            # Tidak ditemukan: jangan diam-diam — beri tahu user + saran
+            logger.warning(f"AI action tak terpetakan: {module_name}.{action}")
+            return (
+                f"⚠️ Maaf, aksi `{module_name}.{action}` belum tersedia.\n"
+                f"Coba `/help` untuk daftar perintah yang didukung."
+            )
 
         except Exception as e:
             logger.error(f"AI action execution error: {e}", exc_info=True)
@@ -491,7 +571,7 @@ class SyamAdminBot:
         if not await self._guard(update):
             return
 
-        # 1. Check if user is currently inside the interactive site wizard
+        # 1. Check if user is currently inside the interactive wizard (site/setup)
         wizard = self._wizard_states.get(self.admin_id)
         if wizard:
             # Hapus wizard yang sudah kadaluarsa
@@ -499,14 +579,54 @@ class SyamAdminBot:
                 del self._wizard_states[self.admin_id]
                 await update.message.reply_text(
                     "⏰ Sesi wizard telah berakhir (timeout 10 menit). "
-                    "Mulai ulang dengan `/site wizard`.",
+                    "Mulai ulang dengan `/site wizard` atau `/setup`.",
                     parse_mode="Markdown",
                 )
                 return
             user_text = update.message.text.strip()
             state = wizard["state"]
 
-            if state == "DOMAIN":
+            # Fase 7: Handler state SETUP_MENU (onboarding wizard)
+            if state == "SETUP_MENU":
+                choice = user_text.strip()
+                if choice == "1":
+                    del self._wizard_states[self.admin_id]
+                    await self.cmd_provision(update, context)
+                    return
+                elif choice == "2":
+                    del self._wizard_states[self.admin_id]
+                    otp = self._generate_otp()
+                    self._pending_confirmations[self.admin_id] = {
+                        "action": "harden_all", "otp": otp,
+                        "expires": datetime.now().timestamp() + 120,
+                    }
+                    await update.message.reply_text(
+                        f"🔐 Akan menjalankan hardening SSH + Fail2Ban + Firewall + Auto-update.\n"
+                        f"Kirim `/confirm {otp}` atau balas `{otp}`.",
+                        parse_mode="Markdown",
+                    )
+                    return
+                elif choice == "3":
+                    self._wizard_states[self.admin_id] = {
+                        "state": "DOMAIN",
+                        "expires": datetime.now().timestamp() + 600,
+                    }
+                    await update.message.reply_text(
+                        "👉 Masukkan nama domain (mis. `contoh.com`):",
+                        parse_mode="Markdown",
+                    )
+                    return
+                elif choice in ("selesai", "done"):
+                    del self._wizard_states[self.admin_id]
+                    await update.message.reply_text("✅ Panduan ditutup. Ketik `/help` kapan saja.")
+                    return
+                else:
+                    await update.message.reply_text(
+                        "❌ Pilihan tidak valid. Ketik `1`, `2`, `3`, atau `selesai`."
+                    )
+                    return
+
+            elif state == "DOMAIN":
                 domain_regex = r"^[a-zA-Z0-9][-a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-a-zA-Z0-9]{0,62})+$"
                 if not re.match(domain_regex, user_text):
                     await update.message.reply_text(
@@ -578,14 +698,25 @@ class SyamAdminBot:
                 )
                 return
 
-        # 2. Check for pending OTP confirmation
+        # 2. Check for pending OTP confirmation (+ terima ya/ok untuk non-destruktif)
         pending = self._pending_confirmations.get(self.admin_id)
         if pending and pending["expires"] > datetime.now().timestamp():
-            user_text = update.message.text.strip()
-            # Support both the raw OTP code or explicit confirm commands
-            if user_text == pending.get("otp"):
+            user_text = update.message.text.strip().lower()
+            is_otp = user_text == pending.get("otp")
+            is_affirmative = (
+                user_text in AFFIRMATIVE_WORDS
+                and pending["action"] not in DESTRUCTIVE_ACTIONS
+            )
+            if is_otp or is_affirmative:
                 del self._pending_confirmations[self.admin_id]
                 await self._execute_confirmed_action(update, pending)
+                return
+            # Jika aksi destruktif & user balas "ya": ingatkan butuh OTP
+            if user_text in AFFIRMATIVE_WORDS:
+                await update.message.reply_text(
+                    "🔐 Aksi ini berisiko. Mohon kirim *kode OTP* yang tertera untuk konfirmasi.",
+                    parse_mode="Markdown",
+                )
                 return
 
         # 3. Otherwise, treat as AI command
@@ -743,6 +874,36 @@ class SyamAdminBot:
             "expires": datetime.now().timestamp() + 120,
         }
 
+    async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Panduan onboarding server untuk pemula."""
+        if not await self._guard(update):
+            return
+        self._wizard_states[self.admin_id] = {
+            "state": "SETUP_MENU",
+            "expires": datetime.now().timestamp() + 600,
+        }
+        await update.message.reply_text(
+            "🧭 *Panduan Setup Server (Pemula)*\n\n"
+            "Saya akan bantu langkah demi langkah:\n"
+            "1️⃣ Pasang LEMP (web server)\n"
+            "2️⃣ Amankan server (hardening + firewall)\n"
+            "3️⃣ Buat website pertama\n\n"
+            "Ketik nomor langkah (`1`/`2`/`3`) atau `selesai`.",
+            parse_mode="Markdown",
+        )
+
+    async def _augment_failure(self, operation: str, text: str) -> str:
+        """Jika text indikasi kegagalan, tambahkan penjelasan AI ramah-pemula."""
+        if "❌" not in text and "gagal" not in text.lower():
+            return text
+        brain = self.modules.get("brain")
+        if not (brain and brain.enabled):
+            return text
+        explanation = await brain.explain_error(operation, text)
+        if explanation:
+            return f"{text}\n\n🧠 *Penjelasan:*\n{explanation}"
+        return text
+
     async def _execute_confirmed_action(self, update: Update, pending: dict):
         """Common executor for all confirmed actions via OTP validation."""
         action = pending["action"]
@@ -889,6 +1050,22 @@ class SyamAdminBot:
                 
             await update.message.reply_text(final_report, parse_mode="Markdown")
 
+        elif action == "restore":
+            filename = pending["filename"]
+            await update.message.reply_text(f"♻️ Memulihkan dari `{filename}`...", parse_mode="Markdown")
+            result = await self.modules["backup"].restore(filename)
+            result = await self._augment_failure("restore backup", result)
+            await update.message.reply_text(result, parse_mode="Markdown")
+
+        elif action == "harden_all":
+            await update.message.reply_text("🔐 Menjalankan hardening menyeluruh...")
+            r1 = await self.modules["security"].harden_ssh()
+            r2 = await self.modules["security"].setup_fail2ban()
+            r3 = await self.modules["firewall"].setup_defaults()
+            r4 = await self.modules["security"].setup_auto_updates()
+            summary = f"🔐 *Hardening Selesai*\n\n{r1}\n\n{r2}\n\n{r3}\n\n{r4}"
+            await update.message.reply_text(summary[:4000], parse_mode="Markdown")
+
         elif action == "change_ssh_port":
             new_port = pending["new_port"]
             await update.message.reply_text(f"🔐 *Mengubah port SSH ke `{new_port}`...*", parse_mode="Markdown")
@@ -923,6 +1100,8 @@ class SyamAdminBot:
         app.add_handler(CommandHandler("optimize", self.cmd_optimize))
         app.add_handler(CommandHandler("security_report", self.cmd_security_report))
         app.add_handler(CommandHandler("harden_ssh_port", self.cmd_harden_ssh_port))
+        app.add_handler(CommandHandler("restore", self.cmd_restore))
+        app.add_handler(CommandHandler("setup", self.cmd_setup))
 
         # Free-text handler (last)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
@@ -942,6 +1121,8 @@ class SyamAdminBot:
             BotCommand("token", "Statistik Token AI"),
             BotCommand("cron", "AI Task Scheduler"),
             BotCommand("optimize", "AI Resource Optimizer"),
+            BotCommand("restore", "Restore dari backup"),
+            BotCommand("setup", "Panduan setup pemula"),
             BotCommand("help", "Bantuan"),
         ])
 

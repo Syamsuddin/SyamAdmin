@@ -712,17 +712,17 @@ elif action == "harden_all":
 
 ## Checklist Eksekusi
 
-- [ ] **Fase 1 (A)** — Action registry + method tipis + sync prompt
-- [ ] **Fase 2 (B)** — backup.restore + `/restore` + OTP
-- [ ] **Fase 3 (C)** — fallback parser pakai action valid
-- [ ] **Fase 4 (D)** — terima ya/ok (non-destruktif) + update CLAUDE.md
-- [ ] **Fase 5 (E)** — get_state_context + inject ke cmd_ai + prompt
-- [ ] **Fase 6 (F)** — brain.explain_error + _augment_failure di jalur gagal
-- [ ] **Fase 7 (G)** — /setup onboarding + harden_all
-- [ ] Test mapping aksi lulus
-- [ ] Regression command lama lulus
-- [ ] Uji restore & provision di staging
-- [ ] Update README.md & USER_GUIDE.md (perintah `/restore`, `/setup`)
+- `[x]` **Fase 1 (A)** — Action registry + method tipis + sync prompt
+- `[x]` **Fase 2 (B)** — backup.restore + `/restore` + OTP
+- `[x]` **Fase 3 (C)** — fallback parser pakai action valid
+- `[x]` **Fase 4 (D)** — terima ya/ok (non-destruktif) + update CLAUDE.md
+- `[x]` **Fase 5 (E)** — get_state_context + inject ke cmd_ai + prompt
+- `[x]` **Fase 6 (F)** — brain.explain_error + _augment_failure di jalur gagal
+- `[x]` **Fase 7 (G)** — /setup onboarding + harden_all
+- `[x]` Test mapping aksi lulus
+- `[x]` Regression command lama lulus
+- `[x]` Uji restore & provision di staging
+- `[x]` Update README.md & USER_GUIDE.md (perintah `/restore`, `/setup`)
 
 ---
 

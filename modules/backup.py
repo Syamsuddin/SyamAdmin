@@ -102,3 +102,48 @@ class BackupManager:
         if r["stdout"]:
             count = len(r["stdout"].strip().split("\n"))
             logger.info(f"Cleaned up {count} old backup files.")
+
+    def _safe_backup_path(self, filename: str):
+        """Pastikan filename berada di dalam backup_dir, tanpa traversal."""
+        candidate = os.path.realpath(os.path.join(self.backup_dir, filename))
+        base = os.path.realpath(self.backup_dir)
+        if not candidate.startswith(base + os.sep):
+            return None
+        if not os.path.exists(candidate):
+            return None
+        return candidate
+
+    async def restore_db(self, filename: str) -> str:
+        """Restore database dari file backup .sql.gz. DESTRUKTIF."""
+        path = self._safe_backup_path(f"db/{filename}") or self._safe_backup_path(filename)
+        if not path:
+            return f"❌ File backup tidak ditemukan / tidak valid: `{filename}`"
+        r = await self.executor.run(
+            f"gunzip -c {path} | mysql", module="backup", timeout=600,
+        )
+        if r["success"]:
+            return f"✅ *Database berhasil dipulihkan* dari `{filename}`."
+        return f"❌ Restore DB gagal:\n```\n{r['stderr'][:500]}\n```"
+
+    async def restore_files(self, filename: str) -> str:
+        """Restore file situs dari tar.gz. Ekstrak ke / (path absolut di arsip)."""
+        path = self._safe_backup_path(f"files/{filename}") or self._safe_backup_path(filename)
+        if not path:
+            return f"❌ File backup tidak ditemukan / tidak valid: `{filename}`"
+        r = await self.executor.run(
+            f"tar xzf {path} -C / 2>/dev/null", module="backup", timeout=600,
+        )
+        if r["success"]:
+            return f"✅ *File situs berhasil dipulihkan* dari `{filename}`."
+        return f"❌ Restore file gagal:\n```\n{r['stderr'][:500]}\n```"
+
+    async def restore(self, filename: str = "") -> str:
+        """Entry-point restore untuk AI. Auto-detect tipe dari nama file."""
+        if not filename:
+            return ("ℹ️ Sebutkan file backup. Lihat daftar via `/backup list`, lalu:\n"
+                    "`/restore <nama_file>`")
+        if filename.endswith(".sql.gz"):
+            return await self.restore_db(filename)
+        if filename.endswith(".tar.gz"):
+            return await self.restore_files(filename)
+        return "❌ Format backup tidak dikenal (harus `.sql.gz` atau `.tar.gz`)."

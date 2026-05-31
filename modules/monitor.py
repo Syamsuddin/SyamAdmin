@@ -29,6 +29,9 @@ class SystemMonitor:
         }
         self._running = False
         self.brain = brain
+        # Cache untuk state context (Fase 5)
+        self._state_cache = None
+        self._state_cache_ts = 0
 
     async def run_loop(self):
         """Main monitoring loop."""
@@ -266,3 +269,73 @@ class SystemMonitor:
         except Exception as e:
             logger.warning(f"Failed to fetch historical trends: {e}")
             return f"Error mengambil data tren: {e}"
+
+    async def get_disk_report(self) -> str:
+        """Laporan penggunaan disk ramah-pemula (untuk /ai cek disk)."""
+        r = await self.executor.run(
+            "df -h / /var /home 2>/dev/null", module="monitor", check=False,
+        )
+        m = await self.collect_metrics()
+        return (
+            f"💽 *Penggunaan Disk*\n"
+            f"{self._progress_bar(m['disk_percent'])} `{m['disk_percent']}%` "
+            f"(`{m['disk_used_gb']}/{m['disk_total_gb']} GB`)\n\n"
+            f"```\n{r['stdout'][:2000]}\n```"
+        )
+
+    async def get_top_processes(self) -> str:
+        """Top 8 proses berdasarkan CPU & RAM."""
+        r = await self.executor.run(
+            "ps aux --sort=-%cpu | head -9 | awk '{print $11, $3\"%cpu\", $4\"%mem\"}'",
+            module="monitor", check=False,
+        )
+        return f"🔝 *Top Proses*\n```\n{r['stdout'][:2000]}\n```"
+
+    async def get_connections(self) -> str:
+        """Ringkasan koneksi jaringan aktif."""
+        r = await self.executor.run(
+            "ss -tunp 2>/dev/null | head -20", module="monitor", check=False,
+        )
+        return f"🌐 *Koneksi Aktif*\n```\n{r['stdout'][:2500]}\n```"
+
+    async def get_state_context(self) -> str:
+        """Ringkas state server untuk konteks AI (di-cache 60 detik)."""
+        now = time.time()
+        if self._state_cache and now - self._state_cache_ts < 60:
+            return self._state_cache
+
+        async def installed(pkg):
+            r = await self.executor.run(
+                f"command -v {pkg} >/dev/null && echo yes || echo no",
+                module="monitor", check=False,
+            )
+            return r["stdout"].strip() == "yes"
+
+        nginx = await installed("nginx")
+        mysql = await installed("mysql")
+        php = await installed("php")
+        lemp = "TERPASANG" if (nginx and mysql and php) else "BELUM terpasang"
+
+        # Daftar site dari DB
+        sites = []
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "SELECT domain, ssl_enabled FROM sites WHERE status='active'"
+            )
+            sites = cur.fetchall()
+            conn.close()
+        except Exception:
+            pass
+        site_str = (
+            ", ".join(f"{d}{'(SSL)' if s else ''}" for d, s in sites)
+            or "belum ada"
+        )
+
+        ctx = (
+            f"LEMP stack: {lemp} (nginx={nginx}, mysql={mysql}, php={php}). "
+            f"Site terkelola: {site_str}."
+        )
+        self._state_cache = ctx
+        self._state_cache_ts = now
+        return ctx

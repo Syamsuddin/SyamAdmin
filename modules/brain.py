@@ -40,14 +40,19 @@ SELALU respond dalam format JSON:
     "message": "pesan untuk admin dalam bahasa Indonesia"
 }
 
-Contoh aksi per modul:
+Contoh aksi per modul (gunakan nama alias berikut, sistem akan menerjemahkan):
 - provisioner: install_lemp, install_package, setup_composer
 - security: harden_ssh, setup_fail2ban, audit, scan_rootkit, check_updates
 - firewall: allow_port, deny_port, list_rules, reset, status
 - monitor: status, services, top_processes, disk_usage, connections
 - site_manager: add_site, remove_site, list_sites, enable_ssl, disable_site
 - backup: backup_db, backup_files, backup_all, list_backups, restore
-- executor: run_command (params: {"command": "..."})
+- executor: service_restart (params: {"service": "..."}), run_command (params: {"command": "..."})
+
+PENTING tentang STATE server:
+- Jika konteks menunjukkan "LEMP stack: BELUM terpasang", JANGAN rutekan ke add_site atau enable_ssl.
+  Set action="clarify" dan sarankan user menjalankan `/provision` atau `/setup` terlebih dahulu.
+- Jika user minta restore, set confirmation_needed=true karena restore bersifat DESTRUKTIF.
 
 Jika perintah berbahaya atau ambigu, set confirmation_needed=true dan jelaskan risikonya di message.
 Jika perintah tidak jelas, minta klarifikasi di message dan set action="clarify".
@@ -218,10 +223,13 @@ class AIBrain:
         """Simple keyword-based parser as fallback when AI is unavailable."""
         msg = message.lower().strip()
 
-        # Simple keyword mapping
+        # Peta keyword -> modul.aksi (semua aksi valid, dijamin alias map)
         mappings = [
             (["status", "kesehatan", "health"], "monitor", "status", {}),
             (["service", "layanan", "servis"], "monitor", "services", {}),
+            (["disk", "storage", "penyimpanan"], "monitor", "disk_usage", {}),
+            (["proses", "process", "cpu tinggi"], "monitor", "top_processes", {}),
+            (["koneksi", "connection", "network"], "monitor", "connections", {}),
             (["provision", "install lemp", "setup server"], "provisioner", "install_lemp", {}),
             (["firewall", "ufw"], "firewall", "status", {}),
             (["security", "keamanan", "audit"], "security", "audit", {}),
@@ -231,8 +239,7 @@ class AIBrain:
             (["restart mysql"], "executor", "service_restart", {"service": "mysql"}),
             (["restart php"], "executor", "service_restart", {"service": "php8.3-fpm"}),
             (["update", "upgrade"], "security", "check_updates", {}),
-            (["disk", "storage"], "monitor", "disk_usage", {}),
-            (["log", "logs"], "monitor", "recent_logs", {}),
+            (["log", "logs"], "monitor", "services", {}),  # fallback aman; /logs punya command sendiri
         ]
 
         for keywords, module, action, params in mappings:
@@ -260,6 +267,7 @@ class AIBrain:
                 "• `/provision` — setup LEMP stack\n"
                 "• `/firewall` — manage firewall\n"
                 "• `/security` — security audit\n"
+                "• `/logs <service>` — lihat log service\n"
                 "• `/help` — bantuan lengkap"
             ),
         }
@@ -446,3 +454,24 @@ class AIBrain:
         except Exception as e:
             self.last_error = str(e)
             return f"Gagal menganalisis keamanan: {e}"
+
+    async def explain_error(self, operation: str, stderr: str) -> str:
+        """Ubah pesan error teknis jadi penjelasan ramah-pemula + langkah perbaikan."""
+        if not self.enabled:
+            return ""  # fallback: pemanggil tetap tampilkan stderr mentah
+        try:
+            client = self._get_client()
+            response = await client.messages.create(
+                model=_AI_MODEL, max_tokens=512,
+                system=("Kamu SyamAdmin. Jelaskan error sysadmin berikut dalam bahasa "
+                        "Indonesia sederhana untuk pemula: apa artinya & 1-2 langkah perbaikan. "
+                        "Singkat, tanpa jargon."),
+                messages=[{"role": "user",
+                           "content": f"Operasi: {operation}\nError:\n```\n{stderr[:1500]}\n```"}],
+            )
+            self.last_error = None
+            self._log_usage(f"explain_error: {operation}", response)
+            return response.content[0].text.strip()
+        except Exception as e:
+            self.last_error = str(e)
+            return ""

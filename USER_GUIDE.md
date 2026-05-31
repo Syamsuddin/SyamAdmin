@@ -239,6 +239,7 @@ Ini adalah daftar singkat semua perintah yang bisa Anda gunakan. Klik nama bagia
 
 | Perintah | Fungsi |
 |----------|--------|
+| `/setup` | Wizard interaktif panduan setup server awal untuk pemula |
 | `/provision` | Install Nginx + MySQL 8 + PHP 8.3 + Certbot (memerlukan konfirmasi) |
 | `/confirm provision` | Konfirmasi dan mulai provisioning |
 
@@ -276,6 +277,7 @@ Ini adalah daftar singkat semua perintah yang bisa Anda gunakan. Klik nama bagia
 | `/backup db` | Backup semua database MySQL saja |
 | `/backup files` | Backup file web + konfigurasi Nginx/PHP |
 | `/backup list` | Tampilkan daftar backup yang tersedia |
+| `/restore <file>` | Memulihkan database atau file dari arsip (memerlukan OTP) |
 
 ### AI & Perintah Natural Language
 
@@ -413,6 +415,25 @@ Menampilkan 15 perintah terakhir yang dieksekusi oleh SyamAdmin, lengkap dengan 
 ❌ 2026-05-31 08:05:22 [executor] apt install redis — rc=1
 ✅ 2026-05-31 08:10:00 [backup] mysqldump --all-databases
 ```
+
+---
+
+### `/setup` — Panduan Setup Server (Wizard)
+
+Memulai wizard interaktif yang memandu Anda mengatur server kosong menjadi siap pakai. Sangat disarankan untuk pemula.
+
+**Cara pakai:**
+
+```
+/setup
+```
+
+**Pilihan yang tersedia:**
+1. **Pasang LEMP (web server)** — akan memanggil proses instalasi Nginx, MySQL, dan PHP.
+2. **Amankan server** — akan mengaktifkan kunci SSH, firewall UFW, dan Fail2Ban secara otomatis.
+3. **Buat website pertama** — akan memandu pembuatan virtual host domain dan database.
+
+Anda cukup membalas dengan mengetik angka `1`, `2`, atau `3` untuk melanjutkan ke langkah berikutnya.
 
 ---
 
@@ -772,6 +793,28 @@ File Backups:
   webfiles_20260530_020030.tar.gz — 155.2 MB — 2026-05-30 02:00
 
 Total: 5 backups | 385.1 MB
+```
+
+#### Memulihkan dari Backup (Restore)
+
+```
+/restore <nama_file>
+```
+
+> ⚠️ **Peringatan penting:** Proses restore bersifat destruktif karena akan menimpa data yang ada saat ini dengan data dari file backup. Proses ini selalu membutuhkan PIN OTP.
+
+Jika file berakhiran `.sql.gz`, SyamAdmin otomatis akan merestore ke database MySQL.
+Jika file berakhiran `.tar.gz`, SyamAdmin akan mengekstrak file ke dalam sistem.
+
+**Contoh output:**
+
+```
+⚠️ Konfirmasi Restore (DESTRUKTIF!)
+
+File: all_databases_20260531_020000.sql.gz
+Data saat ini akan ditimpa oleh isi backup.
+
+Kirim /confirm 1234 atau balas 1234 untuk melanjutkan.
 ```
 
 ---

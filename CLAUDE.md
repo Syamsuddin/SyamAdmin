@@ -71,7 +71,9 @@ Telegram message → SyamAdminBot (command/text handler)
 
 ## Key Design Patterns
 
-**Confirmation flow**: Dangerous operations (provisioning, hardening) set a pending confirmation in `_pending_confirmations[admin_id]` with a 120-second expiry. The user must send `/confirm <action>` or reply "ya/yes/ok" within that window.
+**Confirmation flow**: Dangerous operations set a pending confirmation in `_pending_confirmations[admin_id]` with a 120-second expiry. Two-tier confirmation:
+- **Non-destructive actions** (`ai`, `add_cron`, `optimize_system`): accept affirmative words (`ya/iya/ok/oke/yes/y/lanjut/setuju/gas`) OR the numeric OTP code.
+- **Destructive actions** (`provision`, `remove_site`, `deny_ssh`, `change_ssh_port`, `restore`, `repair_service`, `wizard_provision`): strictly require the OTP code. Affirmative words are rejected with a reminder to use OTP.
 
 **Safety filter**: `CommandExecutor._is_blocked()` checks every shell command against `BLOCKED_PATTERNS` before execution. This cannot be bypassed — it runs before every `executor.run()` call.
 

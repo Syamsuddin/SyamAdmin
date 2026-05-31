@@ -61,11 +61,8 @@ class Provisioner:
 
         # Step 5: Install Composer
         await self.notifier.send("🎼 [5/7] Installing Composer...")
-        r = await self.executor.run(
-            "curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer",
-            module="provisioner", timeout=60,
-        )
-        results.append(("Composer", r["success"]))
+        composer_result = await self.setup_composer()
+        results.append(("Composer", "✅" in composer_result))
 
         # Step 6: Install Certbot
         await self.notifier.send("🔒 [6/7] Installing Certbot...")
@@ -250,6 +247,17 @@ mysql -u root -p'{password}' -e "FLUSH PRIVILEGES;"
         if r["success"]:
             return f"✅ Package `{package}` berhasil diinstall."
         return f"❌ Gagal install `{package}`:\n```\n{r['stderr'][:500]}\n```"
+
+    async def setup_composer(self) -> str:
+        """Install Composer terpisah (bisa dipanggil mandiri via AI)."""
+        r = await self.executor.run(
+            "curl -sS https://getcomposer.org/installer | php -- "
+            "--install-dir=/usr/local/bin --filename=composer",
+            module="provisioner", timeout=60,
+        )
+        if r["success"]:
+            return "✅ Composer berhasil diinstall."
+        return f"❌ Gagal install Composer:\n```\n{r['stderr'][:300]}\n```"
 
     def _format_report(self, results: list, mysql_pass: str) -> str:
         """Format installation report."""

@@ -208,9 +208,12 @@ sudo systemctl enable --now syamadmin
 |---------|-------------|
 | `/status` | Dashboard performa realtime server (CPU, RAM, Disk, Uptime, Jaringan) |
 | `/services` | Memeriksa status kesehatan dari semua managed service |
+| `/setup` | Memulai wizard interaktif panduan setup server langkah-demi-langkah |
 | `/provision` | Menginstall penuh LEMP Stack (Nginx, MySQL, PHP 8.3, Certbot) (OTP) |
 | `/logs [service]` | Membaca 30 baris log terakhir (nginx, mysql, fail2ban, auth, syslog) |
 | `/audit` | Melihat riwayat eksekusi shell yang dicatat oleh Command Executor |
+| `/backup` | Membuat arsip backup untuk database MySQL dan web files |
+| `/restore <file>` | Memulihkan data dari file backup (.sql.gz/.tar.gz) (OTP proteksi) |
 
 ### Virtual Host & SSL
 

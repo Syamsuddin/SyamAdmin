@@ -265,3 +265,24 @@ pm.max_requests = 500
             conn.close()
         except Exception as e:
             logger.warning(f"Failed to save site to DB: {e}")
+
+    async def disable_site(self, domain: str) -> str:
+        """Nonaktifkan site tanpa menghapus config (bisa diaktifkan kembali)."""
+        await self.executor.run(
+            f"rm -f /etc/nginx/sites-enabled/{domain}",
+            module="site_manager",
+        )
+        test = await self.executor.run("nginx -t", module="site_manager", check=False)
+        if test["success"]:
+            await self.executor.run("systemctl reload nginx", module="site_manager")
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.execute(
+                    "UPDATE sites SET status='disabled' WHERE domain=?", (domain,)
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+            return f"⏸️ Site `{domain}` dinonaktifkan (config tetap tersimpan)."
+        return f"❌ Gagal menonaktifkan `{domain}`:\n```\n{test['stderr'][:300]}\n```"
