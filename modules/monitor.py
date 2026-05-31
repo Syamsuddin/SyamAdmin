@@ -5,6 +5,7 @@ Tracks CPU, RAM, disk, load, services, and network.
 
 import asyncio
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime
@@ -32,6 +33,32 @@ class SystemMonitor:
         # Cache untuk state context (Fase 5)
         self._state_cache = None
         self._state_cache_ts = 0
+        # Retention (#5): batasi pertumbuhan DB
+        self._metrics_retention_days = int(os.environ.get("METRICS_RETENTION_DAYS", 30))
+        self._audit_retention_days = int(os.environ.get("AUDIT_RETENTION_DAYS", 90))
+        self._chat_history_retention_days = int(os.environ.get("CHAT_HISTORY_RETENTION_DAYS", 14))
+        self._ltm_max_rows = int(os.environ.get("LONG_TERM_MEMORY_MAX_ROWS", 1000))
+        self._last_prune_ts = 0
+        self._ensure_db()
+
+    def _ensure_db(self):
+        """Pastikan tabel metrics ada — mandiri, tak bergantung pada install.sh."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    metric_type TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    metadata TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp, metric_type);
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Monitor DB init warning: {e}")
 
     async def run_loop(self):
         """Main monitoring loop."""
@@ -44,6 +71,7 @@ class SystemMonitor:
                 await self._store_metrics(metrics)
                 await self._check_thresholds(metrics)
                 await self._check_services()
+                await self._prune_old_data()
             except Exception as e:
                 logger.error(f"Monitor loop error: {e}")
 
@@ -215,6 +243,54 @@ class SystemMonitor:
             *[self._check_single_service(svc) for svc in MANAGED_SERVICES],
             return_exceptions=True,
         )
+
+    async def _prune_old_data(self):
+        """Retention (#5): hapus data lama, maksimal sekali per 24 jam.
+
+        metrics tumbuh ~4 baris/menit sehingga wajib dipangkas; audit_log &
+        token_usage dipangkas dengan retensi lebih panjang agar jejak audit awet.
+        """
+        now = time.time()
+        if now - self._last_prune_ts < 86400:
+            return
+        self._last_prune_ts = now
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cur = conn.execute(
+                "DELETE FROM metrics WHERE timestamp < datetime('now', ?)",
+                (f"-{self._metrics_retention_days} days",),
+            )
+            pruned = cur.rowcount
+            for tbl in ("audit_log", "token_usage"):
+                try:
+                    conn.execute(
+                        f"DELETE FROM {tbl} WHERE timestamp < datetime('now', ?)",
+                        (f"-{self._audit_retention_days} days",),
+                    )
+                except sqlite3.OperationalError:
+                    pass  # tabel belum dibuat — abaikan
+            # Memory Core: chat_history (per umur) + long_term_memory (cap baris)
+            try:
+                conn.execute(
+                    "DELETE FROM chat_history WHERE timestamp < datetime('now', ?)",
+                    (f"-{self._chat_history_retention_days} days",),
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(
+                    "DELETE FROM long_term_memory WHERE id NOT IN "
+                    "(SELECT id FROM long_term_memory ORDER BY id DESC LIMIT ?)",
+                    (self._ltm_max_rows,),
+                )
+            except sqlite3.OperationalError:
+                pass
+            conn.commit()
+            conn.close()
+            if pruned:
+                logger.info(f"Retention: {pruned} baris metrics lama dihapus")
+        except Exception as e:
+            logger.warning(f"Retention prune warning: {e}")
 
     async def _store_metrics(self, metrics: dict):
         """Store metrics in database for trend analysis."""

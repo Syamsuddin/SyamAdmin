@@ -128,6 +128,7 @@ sudo nano /etc/syamadmin/config.env
 | Parameter | Default | Keterangan |
 |-----------|---------|------------|
 | `ANTHROPIC_API_KEY` | *(kosong)* | API key untuk fitur AI Brain. Tanpa ini, `/ai` menggunakan keyword parser sederhana |
+| `CLAUDE_MODEL` | `claude-haiku-4-5-20251001` | Model Claude yang dipakai AI Brain (mis. ganti ke `claude-sonnet-4-6` agar prompt caching aktif) |
 | `SERVER_NAME` | `my-vps-01` | Nama identitas server (ditampilkan di notifikasi) |
 | `SERVER_TIMEZONE` | `Asia/Makassar` | Timezone server |
 
@@ -148,6 +149,10 @@ sudo nano /etc/syamadmin/config.env
 | `SSH_PORT` | `22` | Port SSH (digunakan oleh modul security & firewall) |
 | `BACKUP_DIR` | `/var/backups/syamadmin` | Direktori penyimpanan backup |
 | `BACKUP_RETENTION_DAYS` | `7` | Berapa hari backup disimpan sebelum dihapus otomatis |
+| `METRICS_RETENTION_DAYS` | `30` | Retensi data metrik di SQLite (dipangkas otomatis) |
+| `AUDIT_RETENTION_DAYS` | `90` | Retensi audit log & token usage di SQLite |
+| `CHAT_HISTORY_RETENTION_DAYS` | `14` | Retensi riwayat percakapan Memory Core |
+| `LONG_TERM_MEMORY_MAX_ROWS` | `1000` | Batas maksimum baris pelajaran insiden (yang terlama dibuang) |
 | `PHP_VERSION` | `8.3` | Versi PHP yang diinstall oleh provisioner |
 | `LOG_LEVEL` | `INFO` | Level logging: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 
@@ -258,7 +263,9 @@ Ini adalah daftar singkat semua perintah yang bisa Anda gunakan. Klik nama bagia
 | Perintah | Fungsi |
 |----------|--------|
 | `/security` | Audit keamanan komprehensif |
+| `/security_report` | Laporan ancaman cerdas (AI menganalisis Fail2Ban & auth.log) |
 | `/harden` | Hardening SSH + Fail2Ban + UFW + auto-updates |
+| `/harden_ssh_port <port>` | Pindah port SSH ke port non-standar (OTP + uji koneksi 4-lapis) |
 
 ### Firewall (UFW)
 
@@ -283,7 +290,10 @@ Ini adalah daftar singkat semua perintah yang bisa Anda gunakan. Klik nama bagia
 
 | Perintah | Fungsi |
 |----------|--------|
-| `/ai [perintah bebas]` | Jalankan perintah dalam bahasa Indonesia/Inggris |
+| `/ai [perintah bebas]` | Jalankan perintah bahasa Indonesia/Inggris; aksi tunggal ATAU rencana multi-langkah (autopilot) |
+| `/cron [jadwal bebas]` | Jadwalkan tugas berkala dengan bahasa alami (mis. "backup db tiap jam 3 pagi") |
+| `/optimize` | Analisis tren 7 hari + rekomendasi tuning performa (OTP untuk terapkan) |
+| `/token` | Statistik & estimasi biaya token Claude (USD & IDR) |
 | *(teks bebas)* | Pesan tanpa `/` juga diproses AI secara otomatis |
 
 ### Utilitas
@@ -300,7 +310,7 @@ Ini adalah daftar singkat semua perintah yang bisa Anda gunakan. Klik nama bagia
 
 ### `/status` — Dashboard Server
 
-Menampilkan snapshot kondisi server saat ini secara real-time.
+Menampilkan dashboard kondisi server **secara lengkap** — bukan sekadar resource, tapi juga identitas, jaringan, keamanan, web stack, AI engine, dan memori agen.
 
 **Cara pakai:**
 
@@ -311,27 +321,46 @@ Menampilkan snapshot kondisi server saat ini secara real-time.
 **Contoh output:**
 
 ```
-🖥 Server Status — vps-nustek-01
-⏱ Uptime: 14d 6h 32m
+🖥 SyamAdmin — Status Server
+🏷 Server : vps-nustek-01  (host: srv01)
+🐧 OS     : Ubuntu 22.04.4 LTS  • kernel 5.15.0-91
+🌐 IP     : 10.0.0.5  (publik: 103.x.x.x)
+⏱ Uptime : 14d 6h 32m
 
-CPU [████░░░░░░] 38%
-Cores: 2 | Load: 0.45/0.38/0.31
+📊 Resource
+CPU  [████░░░░░░] 38%  • 2 core • load 0.45/0.38/0.31
+RAM  [██████░░░░] 62%  • 1.2/2.0 GB
+Disk [███░░░░░░░] 34%  • 6.8/20.0 GB
+Net  ↑4521MB ↓12845MB • proc 127
 
-RAM [██████░░░░] 62%
-Used: 1.2/2.0 GB
+🔧 Layanan
+🟢 nginx  🟢 mysql  🟢 php8.3-fpm  🟢 fail2ban  🟢 ssh
 
-Disk [███░░░░░░░] 34%
-Used: 6.8/20.0 GB
+🔐 Keamanan & Jaringan
+SSH port : 22
+Firewall : 🟢 aktif (8 rule)
+Port listen : 22, 80, 443, 3306
+Fail2Ban : 🟢 aktif (3 IP diblokir)
 
-Network
-↑ Sent: 4,521.3 MB | ↓ Recv: 12,845.7 MB
-Processes: 127
+🌐 Web Stack
+LEMP: TERPASANG • Site terkelola: 2 (1 SSL)
+
+🧠 AI Engine
+Model : claude-haiku-4-5-20251001
+API   : 🟢 aktif • 42 panggilan • ≈ $0.012 (Rp196)
+
+💾 Memory Core
+Chat: 16 turn • Pelajaran: 5 • Preferensi: 3
 ```
 
-**Penjelasan kolom:**
+**Penjelasan:**
 
-- **Load:** Angka beban rata-rata 1 menit / 5 menit / 15 menit. Umumnya aman jika di bawah jumlah CPU core.
-- **Progress bar** `[████░░]`: Setiap blok ≈ 10%. Semakin penuh, semakin tinggi penggunaan.
+- **IP publik** di-cache 1 jam (gagal-aman → tampil `n/a` bila offline).
+- **Port listen**: daftar port TCP yang sedang mendengarkan koneksi (`ss -tlnH`).
+- **AI Engine**: model aktif, status koneksi API, jumlah panggilan, dan estimasi biaya.
+- **Memory Core**: jumlah turn percakapan tersimpan, pelajaran insiden, dan preferensi admin.
+- **Load:** beban rata-rata 1/5/15 menit. Umumnya aman jika di bawah jumlah CPU core.
+- Bagian apa pun yang perintahnya tak tersedia tampil `n/a` (tidak membuat seluruh `/status` gagal).
 
 ---
 
@@ -848,6 +877,24 @@ Gunakan `/ai` untuk memberi perintah dalam bahasa bebas — Indonesia atau Inggr
 
 Pesan teks bebas (tanpa awalan `/`) juga otomatis dikirim ke AI Brain — Anda tidak harus selalu mengetik `/ai` di awal.
 
+**Rencana Multi-Langkah (Autopilot).** Jika Anda memberi perintah majemuk dalam satu kalimat, AI menyusunnya menjadi rencana berurutan, lalu menjalankannya dengan *progress tracker* langsung:
+
+```
+/ai backup database, lalu restart nginx, terakhir ubah port ssh ke 2222
+```
+
+```
+🔄 Autopilot — Rencana Kerja
+✅ 1/3 Backup semua database
+⏳ 2/3 Restart service nginx
+💤 3/3 Ubah port SSH ke 2222
+```
+- Bila ada langkah berisiko, **seluruh rencana wajib satu OTP** (balasan "ya" ditolak).
+- Jika satu langkah gagal, sisa langkah **dibatalkan** dan AI menjelaskan penyebabnya (*halt-on-failure*).
+- Saat seluruh rencana sukses, ringkasannya disimpan sebagai *pelajaran* di Memory Core.
+
+**Memori.** AI mengingat preferensi Anda (mis. versi PHP), konteks beberapa percakapan terakhir, dan pelajaran dari insiden lampau — sehingga jawaban makin relevan seiring waktu. Data sensitif (password/token/key) **otomatis disensor** sebelum disimpan.
+
 > Lihat bagian [AI Brain](#12-ai-brain--perintah-natural-language) untuk penjelasan lebih lengkap.
 
 ---
@@ -1188,15 +1235,16 @@ Ketika Anda mengirim `/ai [perintah]`, prosesnya:
 ```
 Anda kirim:  /ai cek kenapa disk penuh
                 ↓
-Agent kumpulkan konteks server (CPU, RAM, disk, uptime)
+Agent kumpulkan konteks: server-state + preferensi + riwayat chat + pelajaran (Memory Core)
                 ↓
-Claude API menganalisis intent + konteks
+Claude API (native tool-use) menentukan aksi terstruktur
                 ↓
-Claude menentukan: modul=monitor, aksi=disk_usage
+  • aksi tunggal  → modul=monitor, aksi=disk_usage
+  • perintah majemuk → rencana multi-langkah (steps[]) → orchestrator
                 ↓
-Agent menjalankan analisis disk
+Agent menjalankan aksi (aksi/rencana berisiko → minta OTP dulu)
                 ↓
-Hasil dilaporkan ke Telegram
+Hasil dilaporkan ke Telegram; percakapan & pelajaran disimpan ke memori
 ```
 
 ### Contoh Perintah AI

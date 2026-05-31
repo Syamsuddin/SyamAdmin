@@ -28,10 +28,10 @@ async def main():
     # Load configuration
     CONFIG_PATH = os.environ.get("CONFIG_PATH", "/etc/syamadmin/config.env")
     if Path(CONFIG_PATH).exists():
-        load_dotenv(CONFIG_PATH)
+        load_dotenv(CONFIG_PATH, override=True)
     else:
         # Fallback local load for testing
-        load_dotenv(Path(__file__).parent.parent / "config.env")
+        load_dotenv(Path(__file__).parent.parent / "config.env", override=True)
 
     db_path = os.environ.get("DB_PATH", "/var/lib/syamadmin/syamadmin.db")
     

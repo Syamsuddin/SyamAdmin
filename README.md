@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>SyamAdmin v2.0 — AI-powered sysadmin agent for Ubuntu 22.04 LTS VPS, controlled entirely via Telegram.</strong><br>
+  <strong>SyamAdmin v3.0 — AI-powered sysadmin agent for Ubuntu 22.04 LTS VPS, controlled entirely via Telegram.</strong><br>
   <sub>From zero configuration to secured production-ready LEMP stack and continuous autopilot maintenance.</sub>
 </p>
 
@@ -17,7 +17,7 @@
   <img src="https://img.shields.io/badge/Ubuntu-22.04_LTS-E95420?style=flat-square&logo=ubuntu&logoColor=white" alt="Ubuntu 22.04">
   <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Telegram_Bot-API_21-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram Bot">
-  <img src="https://img.shields.io/badge/Claude_API-Sonnet_3.5-6B4FBB?style=flat-square&logo=anthropic&logoColor=white" alt="Claude API">
+  <img src="https://img.shields.io/badge/Claude_API-Haiku_4.5-6B4FBB?style=flat-square&logo=anthropic&logoColor=white" alt="Claude API">
   <br>
   <!-- Stack -->
   <img src="https://img.shields.io/badge/Nginx-latest-009639?style=flat-square&logo=nginx&logoColor=white" alt="Nginx">
@@ -28,7 +28,7 @@
   <!-- Meta -->
   <img src="https://img.shields.io/badge/license-GPL--2.0-22C55E?style=flat-square&logo=gnu&logoColor=white" alt="License GPL-2.0">
   <img src="https://img.shields.io/badge/modules-11-A78BFA?style=flat-square" alt="11 Modules">
-  <img src="https://img.shields.io/badge/version-2.0_Smart_AI-F59E0B?style=flat-square" alt="v2.0 Smart AI">
+  <img src="https://img.shields.io/badge/version-3.0_Memory_Core-F59E0B?style=flat-square" alt="v3.0 Memory Core">
   <img src="https://img.shields.io/badge/PRs-welcome-F472B6?style=flat-square" alt="PRs Welcome">
 </p>
 
@@ -38,7 +38,7 @@
 
 **SyamAdmin** adalah agen sysadmin kecerdasan buatan (*AI sysadmin agent*) mandiri yang berjalan sebagai daemon di latar belakang Ubuntu VPS Anda. SyamAdmin mengotomatiskan pengelolaan server dari instalasi bersih kosong hingga menjadi server produksi hosting LEMP stack yang terkonfigurasi optimal, ter-hardening, dan terpantau 24/7 — dikendalikan seluruhnya melalui chat bot Telegram yang ramah.
 
-Dengan versi **v2.0 Smart AI Expansion**, admin awam maupun pemula dapat berinteraksi dengan server dalam bahasa alami (Indonesia/Inggris). AI mendiagnosis kegagalan secara mandiri, merekomendasikan optimasi, menjadwalkan tugas berkala, memandu setup website interaktif, dan melindungi seluruh tindakan kritis lewat **Central OTP Confirmation Flow**.
+Dengan versi **v3.0 Memory Core & Autopilot**, admin awam maupun pemula dapat berinteraksi dengan server dalam bahasa alami (Indonesia/Inggris). AI kini ber-**memori** (mengingat preferensi, riwayat percakapan, dan pelajaran insiden), mampu menyusun & menjalankan **rencana multi-langkah** dari satu kalimat, mendiagnosis kegagalan secara mandiri, merekomendasikan optimasi, menjadwalkan tugas berkala, memandu setup website interaktif, dan melindungi seluruh tindakan kritis lewat **Central OTP Confirmation Flow**. Seluruh keputusan AI memakai **native tool-use** Anthropic (output terstruktur terjamin) dengan model default **Claude Haiku 4.5**.
 
 ```
 You:  /provision
@@ -60,7 +60,7 @@ Bot:  🧙‍♂️ Interactive Site Setup Wizard started...
 
 ---
 
-## 🧠 Fitur Cerdas Unggulan (Advanced Smart AI Features v2.0)
+## 🧠 Fitur Cerdas Unggulan (Advanced Smart AI Features v3.0)
 
 > [!NOTE]
 > Seluruh fitur baru dirancang dengan keamanan mutlak dan kemudahan operasional maksimal bagi pengguna yang tidak memiliki latar belakang keahlian teknis Linux (layperson).
@@ -68,7 +68,7 @@ Bot:  🧙‍♂️ Interactive Site Setup Wizard started...
 ### 🛠️ 1. AI Autopilot Troubleshooting & Auto-Repair
 Jika ada layanan utama (Nginx, MySQL, PHP-FPM) yang mati mendadak:
 - **Deteksi Mandiri**: Monitor mendeteksi crash secara langsung dan mengambil 50 baris berkas log terakhir.
-- **Diagnosis AI**: Claude 3.5 Sonnet menganalisis log untuk memetakan penyebab utama, solusi awam, serta risiko tindakan.
+- **Diagnosis AI**: Claude Haiku 4.5 menganalisis log untuk memetakan penyebab utama, solusi awam, serta risiko tindakan.
 - **Otomatisasi Solusi**: Bot menyuguhkan analisis beserta PIN OTP sekali ketik untuk menjalankan tindakan perbaikan otomatis (*One-Click Repair*).
 
 ### 📅 2. Natural Language Task Scheduler (AI Cron)
@@ -99,8 +99,22 @@ Melindungi server dari serangan brute-force dan eksploitasi eksternal:
   5. Hapus port lama 22 dari firewall UFW.
 
 ### 💰 6. Claude API Token Utilization Statistics
-- Memantau volume input/output token Claude 3.5 Sonnet secara real-time.
+- Memantau volume input/output token Claude Haiku 4.5 secara real-time.
 - Melacak total pemanggilan API dan menghitung estimasi biaya riil penggunaan AI dalam mata uang USD dan IDR (`Rp`) langsung di ruang obrolan Telegram melalui perintah `/token`.
+
+### 🧩 7. Multi-Step AI Orchestrator (Autopilot)
+Satu kalimat majemuk → serangkaian aksi berurutan yang dieksekusi otomatis dan transparan:
+- AI memecah perintah seperti *"backup database, lalu restart nginx, terakhir ubah port SSH ke 2222"* menjadi rencana langkah-demi-langkah terstruktur (native tool-use).
+- **Live Progress Tracker**: satu pesan status yang terus diperbarui (✅ selesai / ⏳ berjalan / 💤 menunggu).
+- **Halt-on-failure**: jika satu langkah gagal, sisa langkah dibatalkan dan AI menjelaskan penyebabnya — tidak ada eksekusi membabi buta.
+- **Gerbang OTP terpadu**: bila ada langkah berisiko, seluruh rencana wajib satu OTP (kata "ya" ditolak).
+
+### 💾 8. Persistent Memory Core (Quad-Core Memory)
+Agen kini ber-memori, bukan sekadar reaktif:
+- **Preferensi admin** (versi PHP, timezone) diingat permanen.
+- **Riwayat percakapan** (sliding window) untuk konteks multi-giliran.
+- **Pelajaran insiden** dicatat tiap rencana sukses & dicari relevan via SQLite **FTS5**.
+- **Redaksi rahasia otomatis**: password/token/API key disensor sebelum disimpan ke memori.
 
 ---
 
@@ -113,8 +127,8 @@ Melindungi server dari serangan brute-force dan eksploitasi eksternal:
 └──────────────────────┬───────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────┐
-│                  AI Brain                    │  ← Claude 3.5 Sonnet
-│  (NLP Parser · Troubleshooting · Threat Scan)│
+│                  AI Brain                    │  ← Claude Haiku 4.5 (Tool-Use)
+│  Memory Core · Planner · Troubleshoot · Scan │
 └──────────────────────┬───────────────────────┘
                        │
 ┌──────────────────────▼───────────────────────┐
@@ -138,7 +152,8 @@ Melindungi server dari serangan brute-force dan eksploitasi eksternal:
                        │
 ┌──────────────────────▼───────────────────────┐
 │               SQLite Database                │
-│  (Sites · Token Usage · Metrics · Audit Logs)│
+│  Sites · Metrics · Audit · Token · Memory    │
+│  (user_memory · chat_history · long_term+FTS)│
 └──────────────────────────────────────────────┘
 ```
 
@@ -195,6 +210,7 @@ sudo systemctl enable --now syamadmin
 
 | Command | Deskripsi | Protokol Keamanan |
 |---------|-------------|-------------------|
+| `/ai <perintah bebas>` | Perintah bahasa alami; AI memilih aksi tunggal ATAU menyusun rencana multi-langkah (autopilot) | OTP untuk aksi/rencana berisiko |
 | `/site wizard` | Membuka panduan interaktif langkah-demi-langkah setup website + DB | **OTP Dinamis** sebelum eksekusi |
 | `/security_report` | Mengurai Fail2Ban & auth.log, AI menyusun laporan ancaman eksekutif | Informasi (Aman langsung) |
 | `/harden_ssh_port <PORT>` | Memindahkan port SSH default ke port non-standar pilihan Anda | **OTP + 4-Layer Connection Test** |
@@ -206,7 +222,7 @@ sudo systemctl enable --now syamadmin
 
 | Command | Deskripsi |
 |---------|-------------|
-| `/status` | Dashboard performa realtime server (CPU, RAM, Disk, Uptime, Jaringan) |
+| `/status` | Dashboard lengkap: identitas server & IP (lokal+publik), resource, status layanan, firewall & port terbuka, Fail2Ban, web stack, AI engine, & Memory Core |
 | `/services` | Memeriksa status kesehatan dari semua managed service |
 | `/setup` | Memulai wizard interaktif panduan setup server langkah-demi-langkah |
 | `/provision` | Menginstall penuh LEMP Stack (Nginx, MySQL, PHP 8.3, Certbot) (OTP) |
@@ -288,6 +304,9 @@ syamadmin/
 
 - [x] Scheduled task with cron expression support (via `/cron` NLP Scheduler)
 - [x] Automated performance tuning recommendations (via `/optimize` Advisor)
+- [x] Native tool-use AI routing (structured output, no fragile JSON parsing)
+- [x] Multi-step AI orchestrator with live progress & halt-on-failure
+- [x] Persistent Memory Core (preferences, chat history, incident lessons via FTS5)
 - [ ] Docker container monitoring integration
 - [ ] Webhook support for CI/CD pipelines
 - [ ] Web dashboard (localhost) for visual metrics

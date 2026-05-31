@@ -15,7 +15,9 @@ from dotenv import load_dotenv
 # Load config
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "/etc/syamadmin/config.env")
 if Path(CONFIG_PATH).exists():
-    load_dotenv(CONFIG_PATH)
+    # override=True: file config adalah sumber otoritatif, menimpa env shell
+    # yang mungkin berisi nilai basi (mis. ANTHROPIC_API_KEY lama di ~/.zshrc).
+    load_dotenv(CONFIG_PATH, override=True)
 
 # Setup logging
 LOG_FILE = os.environ.get("LOG_FILE", "/var/log/syamadmin/agent.log")

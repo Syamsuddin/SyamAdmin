@@ -53,9 +53,21 @@ class Notifier:
                 )
                 if resp.status_code == 200:
                     return True
-                else:
-                    logger.warning(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
-                    return False
+                # Fallback (#6): jika Markdown gagal di-parse, kirim ulang teks polos
+                # agar alert/laporan otonom tidak hilang diam-diam.
+                if resp.status_code == 400 and parse_mode and "parse" in resp.text.lower():
+                    logger.warning(f"Markdown gagal di-parse, fallback teks polos: {resp.text[:150]}")
+                    resp2 = await client.post(
+                        f"{self.api_url}/sendMessage",
+                        json={
+                            "chat_id": target,
+                            "text": text[:4096],
+                            "disable_notification": silent,
+                        },
+                    )
+                    return resp2.status_code == 200
+                logger.warning(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
+                return False
             except Exception as e:
                 logger.error(f"Telegram send error: {e}")
                 return False

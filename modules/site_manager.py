@@ -60,6 +60,27 @@ class SiteManager:
         self.db_path = db_path
         self.php_version = os.environ.get("PHP_VERSION", "8.3")
         self.web_root_base = "/var/www"
+        self._ensure_db()
+
+    def _ensure_db(self):
+        """Pastikan tabel sites ada — mandiri, tak bergantung pada install.sh."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT UNIQUE NOT NULL,
+                    root_path TEXT NOT NULL,
+                    php_version TEXT DEFAULT '8.3',
+                    ssl_enabled INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'active'
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"SiteManager DB init warning: {e}")
 
     async def add_site(self, domain: str, root_path: str = "", framework: str = "default") -> str:
         """Add a new Nginx vhost for a domain."""

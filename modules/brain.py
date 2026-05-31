@@ -6,12 +6,37 @@ Translates human instructions into sysadmin actions.
 import json
 import logging
 import os
+import re
+import sqlite3
 from typing import Optional
 
 logger = logging.getLogger("syamadmin.brain")
 
 # Single source of truth for the model — override via CLAUDE_MODEL env var
-_AI_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+_AI_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+
+# Redaksi rahasia (#4 plan): cegah kredensial tersimpan plaintext di memori SQLite.
+# Wizard provisioning men-generate & menampilkan password DB; tanpa redaksi, ia
+# akan ikut tersimpan di chat_history / long_term_memory.
+_SECRET_PATTERNS = [
+    re.compile(r"sk-ant-[A-Za-z0-9_\-]+"),                       # Anthropic API key
+    re.compile(r"\b\d{6,}:[A-Za-z0-9_\-]{30,}\b"),               # Telegram bot token
+    re.compile(r"(?i)(password|passwd|pass|pwd|secret|token|api[_-]?key)\s*[:=]\s*\S+"),
+]
+
+
+def redact_secrets(text: str) -> str:
+    """Ganti pola rahasia (key, token, password) dengan [REDACTED]."""
+    if not text:
+        return text
+    for pat in _SECRET_PATTERNS:
+        text = pat.sub("[REDACTED]", text)
+    return text
+
+# Tarif harga per token (USD) — sesuaikan dengan model aktif.
+# Haiku 4.5: $1 / 1M input, $5 / 1M output. Verifikasi berkala ke pricing resmi Anthropic.
+_PRICE_INPUT_PER_TOKEN = 0.000001
+_PRICE_OUTPUT_PER_TOKEN = 0.000005
 
 SYSTEM_PROMPT = """Kamu adalah SyamAdmin, AI sysadmin agent yang mengelola server Ubuntu 22.04 VPS.
 Kamu menerima perintah dalam bahasa Indonesia atau Inggris dari admin via Telegram.
@@ -30,15 +55,12 @@ Modul yang tersedia:
 - backup: Database backup, file backup, restore
 - executor: Direct shell command (HATI-HATI, hanya untuk advanced users)
 
-SELALU respond dalam format JSON:
-{
-    "intent": "deskripsi singkat apa yang diminta",
-    "module": "nama_modul",
-    "action": "nama_aksi",
-    "params": {},
-    "confirmation_needed": true/false,
-    "message": "pesan untuk admin dalam bahasa Indonesia"
-}
+Untuk MENJALANKAN perintah, PANGGIL tool `execute_sysadmin_action` dengan argumen yang sesuai.
+Jika perintah MAJEMUK (beberapa aksi sekaligus, mis. "backup db lalu restart nginx lalu ubah port ssh"),
+isi field `steps` dengan daftar aksi BERURUTAN sesuai urutan diminta. Untuk aksi TUNGGAL, kosongkan `steps`
+dan isi module/action/params seperti biasa.
+Jika perintah tidak jelas/ambigu, JANGAN panggil tool — cukup balas dengan teks pertanyaan
+klarifikasi dalam bahasa Indonesia.
 
 Contoh aksi per modul (gunakan nama alias berikut, sistem akan menerjemahkan):
 - provisioner: install_lemp, install_package, setup_composer
@@ -51,12 +73,66 @@ Contoh aksi per modul (gunakan nama alias berikut, sistem akan menerjemahkan):
 
 PENTING tentang STATE server:
 - Jika konteks menunjukkan "LEMP stack: BELUM terpasang", JANGAN rutekan ke add_site atau enable_ssl.
-  Set action="clarify" dan sarankan user menjalankan `/provision` atau `/setup` terlebih dahulu.
+  JANGAN panggil tool — balas teks yang menyarankan user menjalankan `/provision` atau `/setup` dulu.
 - Jika user minta restore, set confirmation_needed=true karena restore bersifat DESTRUKTIF.
 
-Jika perintah berbahaya atau ambigu, set confirmation_needed=true dan jelaskan risikonya di message.
-Jika perintah tidak jelas, minta klarifikasi di message dan set action="clarify".
+Jika perintah berbahaya atau ambigu, set confirmation_needed=true dan jelaskan risikonya di field message.
+Jika perintah tidak jelas, JANGAN panggil tool — balas teks klarifikasi.
 """
+
+# Definisi tool untuk native tool-use (#2): menggantikan parsing JSON-dalam-teks
+# yang rapuh. Model dipaksa menghasilkan struktur valid; module dibatasi enum.
+DISPATCH_TOOL = {
+    "name": "execute_sysadmin_action",
+    "description": (
+        "Jalankan SATU aksi sysadmin pada server Ubuntu. Pilih module dan action "
+        "yang tepat berdasarkan perintah admin serta konteks state server."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string", "description": "deskripsi singkat maksud perintah"},
+            "module": {
+                "type": "string",
+                "enum": ["provisioner", "security", "firewall", "monitor",
+                         "site_manager", "backup", "executor"],
+                "description": "modul tujuan",
+            },
+            "action": {"type": "string", "description": "nama aksi sesuai daftar alias yang diketahui"},
+            "params": {
+                "type": "object",
+                "description": "parameter aksi, mis. {\"service\":\"nginx\"} atau {\"command\":\"...\"}",
+                "additionalProperties": True,
+            },
+            "confirmation_needed": {
+                "type": "boolean",
+                "description": "true bila aksi berbahaya, destruktif, atau ambigu",
+            },
+            "message": {"type": "string", "description": "pesan ramah untuk admin dalam bahasa Indonesia"},
+            "steps": {
+                "type": "array",
+                "description": (
+                    "Untuk perintah MAJEMUK: daftar aksi berurutan. Kosongkan untuk aksi tunggal."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "module": {
+                            "type": "string",
+                            "enum": ["provisioner", "security", "firewall", "monitor",
+                                     "site_manager", "backup", "executor"],
+                        },
+                        "action": {"type": "string"},
+                        "params": {"type": "object", "additionalProperties": True},
+                        "message": {"type": "string", "description": "deskripsi singkat langkah ini"},
+                    },
+                    "required": ["module", "action", "message"],
+                },
+            },
+        },
+        "required": ["intent", "module", "action", "confirmation_needed", "message"],
+    },
+}
 
 
 class AIBrain:
@@ -68,16 +144,18 @@ class AIBrain:
         self._client = None
         self.enabled = bool(api_key)
         self.last_error = None
+        self.model = _AI_MODEL
         self._ensure_db()
 
         if not self.enabled:
             logger.warning("AI Brain disabled — no ANTHROPIC_API_KEY configured")
 
     def _ensure_db(self):
+        """Pastikan tabel token_usage + Memory Core (Pilar 2-4) ada — mandiri."""
+        self._fts_enabled = False
         try:
-            import sqlite3
             conn = sqlite3.connect(self.db_path)
-            conn.execute("""
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS token_usage (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -85,12 +163,46 @@ class AIBrain:
                     input_tokens INTEGER NOT NULL,
                     output_tokens INTEGER NOT NULL,
                     model TEXT NOT NULL
-                )
+                );
+                CREATE TABLE IF NOT EXISTS user_memory (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS long_term_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    category TEXT NOT NULL,
+                    summary TEXT NOT NULL
+                );
             """)
             conn.commit()
+            # FTS5 untuk pencarian relevan long_term_memory — opsional & degradasi mulus
+            try:
+                conn.executescript("""
+                    CREATE VIRTUAL TABLE IF NOT EXISTS long_term_fts
+                        USING fts5(summary, content='long_term_memory', content_rowid='id');
+                    CREATE TRIGGER IF NOT EXISTS ltm_ai AFTER INSERT ON long_term_memory BEGIN
+                        INSERT INTO long_term_fts(rowid, summary) VALUES (new.id, new.summary);
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS ltm_ad AFTER DELETE ON long_term_memory BEGIN
+                        INSERT INTO long_term_fts(long_term_fts, rowid, summary)
+                        VALUES('delete', old.id, old.summary);
+                    END;
+                """)
+                conn.commit()
+                self._fts_enabled = True
+            except sqlite3.OperationalError as e:
+                logger.warning(f"FTS5 tak tersedia, long_term_memory pakai LIKE: {e}")
             conn.close()
         except Exception as e:
-            logger.warning(f"Token DB init warning: {e}")
+            logger.warning(f"Brain DB init warning: {e}")
 
     def log_token_usage(self, action: str, input_tokens: int, output_tokens: int, model: str):
         """Log token consumption metrics into SQLite database."""
@@ -109,7 +221,7 @@ class AIBrain:
     def get_token_statistics(self) -> dict:
         """
         Calculate total token usage and estimate API costs.
-        Claude 3.5 Sonnet: $3.00 / 1M input tokens, $15.00 / 1M output tokens.
+        Tarif mengikuti _PRICE_*_PER_TOKEN (default: Haiku 4.5 = $1/1M in, $5/1M out).
         """
         stats = {
             "total_input": 0,
@@ -137,14 +249,127 @@ class AIBrain:
                 stats["total_tokens"] = row[0] + row[1]
                 stats["calls_count"] = row[2]
 
-                # Input: $3/1M, Output: $15/1M
-                stats["cost_usd"] = (row[0] * 0.000003) + (row[1] * 0.000015)
+                stats["cost_usd"] = (row[0] * _PRICE_INPUT_PER_TOKEN) + (row[1] * _PRICE_OUTPUT_PER_TOKEN)
                 # Assume $1 USD = Rp 16,300
                 stats["cost_idr"] = stats["cost_usd"] * 16300.0
         except Exception as e:
             logger.warning(f"Failed to fetch token stats: {e}")
 
         return stats
+
+    # ==================== Memory Core (Pilar 2-4) ====================
+
+    def store_user_preference(self, key: str, value: str) -> None:
+        """Pilar 2: simpan/perbarui preferensi admin."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO user_memory (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+                (key[:64], str(value)[:512]),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"store_user_preference warning: {e}")
+
+    def get_user_preferences(self) -> dict:
+        """Pilar 2: ambil semua preferensi admin."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute("SELECT key, value FROM user_memory").fetchall()
+            conn.close()
+            return {k: v for k, v in rows}
+        except Exception:
+            return {}
+
+    def add_to_chat_history(self, role: str, content: str) -> None:
+        """Pilar 3: simpan satu turn percakapan (sudah diredaksi)."""
+        if role not in ("user", "assistant") or not content:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO chat_history (role, content) VALUES (?, ?)",
+                (role, redact_secrets(content)[:2000]),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"add_to_chat_history warning: {e}")
+
+    def get_recent_history(self, limit: int = 8) -> list:
+        """Pilar 3: ambil N turn terakhir (urutan kronologis) sebagai message turns."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                "SELECT role, content FROM chat_history ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            conn.close()
+            return [{"role": r, "content": c} for r, c in reversed(rows)]
+        except Exception:
+            return []
+
+    def learn_lesson(self, category: str, summary: str) -> None:
+        """Pilar 4: catat pelajaran insiden/konfigurasi (sudah diredaksi)."""
+        if not summary:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "INSERT INTO long_term_memory (category, summary) VALUES (?, ?)",
+                (category[:32], redact_secrets(summary)[:1000]),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"learn_lesson warning: {e}")
+
+    def get_memory_stats(self) -> dict:
+        """Hitung jumlah baris tiap pilar memori (untuk laporan /status)."""
+        out = {"chat": 0, "lessons": 0, "prefs": 0}
+        try:
+            conn = sqlite3.connect(self.db_path)
+            out["chat"] = conn.execute("SELECT COUNT(*) FROM chat_history").fetchone()[0]
+            out["lessons"] = conn.execute("SELECT COUNT(*) FROM long_term_memory").fetchone()[0]
+            out["prefs"] = conn.execute("SELECT COUNT(*) FROM user_memory").fetchone()[0]
+            conn.close()
+        except Exception:
+            pass
+        return out
+
+    def query_long_term_memory(self, query_text: str, top_n: int = 3) -> list:
+        """Pilar 4: cari pelajaran relevan via FTS5 (fallback LIKE)."""
+        if not query_text:
+            return []
+        try:
+            conn = sqlite3.connect(self.db_path)
+            if self._fts_enabled:
+                # Ambil token kata kunci → query FTS5 OR
+                terms = [t for t in re.findall(r"[A-Za-z0-9]{3,}", query_text.lower())][:6]
+                if not terms:
+                    conn.close()
+                    return []
+                fts_q = " OR ".join(terms)
+                rows = conn.execute(
+                    "SELECT m.summary FROM long_term_fts f "
+                    "JOIN long_term_memory m ON m.id = f.rowid "
+                    "WHERE long_term_fts MATCH ? ORDER BY rank LIMIT ?",
+                    (fts_q, top_n),
+                ).fetchall()
+            else:
+                like = f"%{query_text[:50]}%"
+                rows = conn.execute(
+                    "SELECT summary FROM long_term_memory WHERE summary LIKE ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (like, top_n),
+                ).fetchall()
+            conn.close()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.warning(f"query_long_term_memory warning: {e}")
+            return []
 
     def _get_client(self):
         if self._client is None and self.enabled:
@@ -174,12 +399,16 @@ class AIBrain:
         return json.loads(text)
 
     async def process_command(
-        self, user_message: str, context: str = ""
+        self, user_message: str, context: str = "", history: list = None
     ) -> dict:
         """
         Process a natural language command and return structured action.
 
-        Returns dict with: intent, module, action, params, confirmation_needed, message
+        history: daftar turn percakapan [{role, content}, ...] (Pilar 3) untuk
+        konteks multi-turn — dikirim sebagai message turns, BUKAN di-cache.
+
+        Returns dict with: intent, module, action, params, confirmation_needed,
+        message, dan (opsional) steps untuk perintah majemuk.
         """
         if not self.enabled:
             return self._fallback_parse(user_message)
@@ -190,30 +419,76 @@ class AIBrain:
             if context:
                 prompt = f"Konteks server saat ini:\n{context}\n\nPerintah admin:\n{user_message}"
 
+            # Riwayat (volatil) di blok messages — tidak di-cache. Prefix statis
+            # (system+tools) yang di-cache.
+            messages = list(history or [])
+            messages.append({"role": "user", "content": prompt})
+
             response = await client.messages.create(
                 model=_AI_MODEL,
                 max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": prompt}],
+                # Prompt caching (#7): tandai prefix statis (tools + system) sebagai
+                # cacheable agar tidak ditagih penuh tiap panggilan /ai. Cache-control
+                # pada blok system mencakup tools yang mendahuluinya. Aktif bila prefix
+                # >= minimum token model (Haiku 2048; Sonnet/Opus 1024) — di bawah itu
+                # ditandai aman tanpa efek, dan otomatis berlaku saat prompt membesar.
+                system=[{
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                tools=[DISPATCH_TOOL],
+                messages=messages,
             )
 
             self.last_error = None
             self._log_usage(f"command: {user_message[:150]}", response)
 
-            result = self._extract_json(response.content[0].text)
-            logger.info(f"AI parsed: intent={result.get('intent')}, module={result.get('module')}, action={result.get('action')}")
-            return result
+            # Cari blok tool_use → struktur dijamin valid oleh skema tool
+            for block in response.content:
+                if getattr(block, "type", None) == "tool_use":
+                    inp = block.input or {}
+                    result = {
+                        "intent": inp.get("intent", ""),
+                        "module": inp.get("module", ""),
+                        "action": inp.get("action", ""),
+                        "params": inp.get("params") or {},
+                        "confirmation_needed": bool(inp.get("confirmation_needed", False)),
+                        "message": inp.get("message", ""),
+                    }
+                    # Multi-step (#planner): sertakan steps bila ada & valid (>1)
+                    steps = inp.get("steps") or []
+                    if isinstance(steps, list) and len(steps) > 1:
+                        result["steps"] = [
+                            {
+                                "module": s.get("module", ""),
+                                "action": s.get("action", ""),
+                                "params": s.get("params") or {},
+                                "message": s.get("message", ""),
+                            }
+                            for s in steps
+                            if s.get("module") and s.get("action")
+                        ]
+                    logger.info(
+                        f"AI tool_use: module={result['module']}, action={result['action']}, "
+                        f"steps={len(result.get('steps', []))}, confirm={result['confirmation_needed']}"
+                    )
+                    return result
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"AI response not valid JSON: {e}")
+            # Tidak ada tool_use → model memilih klarifikasi (jawaban teks)
+            text = "".join(
+                getattr(b, "text", "") for b in response.content
+                if getattr(b, "type", None) == "text"
+            ).strip()
             return {
-                "intent": "parse_error",
+                "intent": "clarify",
                 "module": "brain",
                 "action": "clarify",
                 "params": {},
                 "confirmation_needed": False,
-                "message": f"Maaf, saya tidak bisa memahami perintah itu. Bisa diperjelas?\n\nPerintah: _{user_message}_",
+                "message": text or "Bisa diperjelas maksud perintahnya?",
             }
+
         except Exception as e:
             self.last_error = str(e)
             logger.error(f"AI Brain error: {e}")
