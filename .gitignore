@@ -24,3 +24,5 @@ TASK_PLAN_UPDATE.md
 CLAUDE.md
 .claude/
 git_push.sh
+scratch/
+
