@@ -8,7 +8,49 @@ import sqlite3
 
 logger = logging.getLogger("syamadmin.site_manager")
 
-VHOST_TEMPLATE = """server {{
+VHOST_TEMPLATE_IPV4_ONLY = """server {{
+    listen 80;
+    server_name {domain} www.{domain};
+    root {root_path};
+    index index.php index.html;
+
+    # Logging
+    access_log /var/log/nginx/{domain}.access.log;
+    error_log /var/log/nginx/{domain}.error.log;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+    # PHP-FPM
+    location ~ \\.php$ {{
+        fastcgi_pass unix:/run/php/php{php_version}-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_hide_header X-Powered-By;
+    }}
+
+    # Static assets caching
+    location ~* \\.(jpg|jpeg|png|gif|ico|css|js|svg|woff2?)$ {{
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+    }}
+
+    # Deny hidden files
+    location ~ /\\. {{
+        deny all;
+    }}
+
+    # Laravel / general PHP framework support
+    location / {{
+        try_files $uri $uri/ /index.php?$query_string;
+    }}
+}}
+"""
+
+VHOST_TEMPLATE_WITH_IPV6 = """server {{
     listen 80;
     listen [::]:80;
     server_name {domain} www.{domain};
@@ -23,6 +65,7 @@ VHOST_TEMPLATE = """server {{
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 
     # PHP-FPM
     location ~ \\.php$ {{
@@ -82,6 +125,36 @@ class SiteManager:
         except Exception as e:
             logger.warning(f"SiteManager DB init warning: {e}")
 
+    async def _check_ipv6_support(self) -> bool:
+        """Cek apakah kernel support IPv6 (aman di VPS minimal/container).
+
+        Return: True jika safe gunakan listen [::], False jika IPv4-only.
+        """
+        # Cek sysctl disable flag
+        r = await self.executor.run(
+            "sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 'error'",
+            module="site_manager", check=False,
+        )
+        if "disable_ipv6 = 1" in r["stdout"]:
+            logger.warning(f"IPv6 disabled (sysctl) — gunakan IPv4-only untuk {self.db_path}")
+            return False
+        if "error" in r["stdout"]:
+            logger.warning("Cannot determine IPv6 status — fallback IPv4-only (safest untuk clean VPS)")
+            return False
+
+        # Cek ada inet6 address (non-loopback)
+        r = await self.executor.run(
+            "ip addr | grep inet6 | grep -v 'fe80:' | wc -l",
+            module="site_manager", check=False,
+        )
+        count = int(r["stdout"].strip() or 0)
+        if count > 0:
+            logger.info("IPv6 support OK")
+            return True
+
+        logger.warning("No IPv6 addresses detected — IPv4-only Nginx config")
+        return False
+
     async def add_site(self, domain: str, root_path: str = "", framework: str = "default") -> str:
         """Add a new Nginx vhost for a domain."""
         if not root_path:
@@ -110,8 +183,12 @@ class SiteManager:
             module="site_manager",
         )
 
+        # Deteksi IPv6 support untuk memilih template yang tepat
+        ipv6_ok = await self._check_ipv6_support()
+        template = VHOST_TEMPLATE_WITH_IPV6 if ipv6_ok else VHOST_TEMPLATE_IPV4_ONLY
+
         # Generate vhost config
-        vhost = VHOST_TEMPLATE.format(
+        vhost = template.format(
             domain=domain,
             root_path=root_path,
             php_version=self.php_version,

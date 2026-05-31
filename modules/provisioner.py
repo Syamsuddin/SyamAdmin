@@ -23,6 +23,36 @@ class Provisioner:
         chars = string.ascii_letters + string.digits + "!@#$%^&*"
         return "".join(secrets.choice(chars) for _ in range(length))
 
+    async def _detect_ipv6_support(self) -> bool:
+        """Deteksi apakah kernel support IPv6 (tidak akan fail di VPS tanpa IPv6).
+
+        Return: True jika IPv6 available (aman gunakan listen [::]), False jika tidak.
+        """
+        # Test 1: cek sysctl disable flag
+        r = await self.executor.run(
+            "sysctl net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 'error'",
+            module="provisioner", check=False,
+        )
+        if "disable_ipv6 = 1" in r["stdout"]:
+            logger.warning("IPv6 disabled via sysctl")
+            return False
+        if "error" in r["stdout"]:
+            logger.warning("Could not check sysctl IPv6 — assuming not supported (VPS minimal)")
+            return False
+
+        # Test 2: cek apakah inet6 address ada (fallback jika sysctl gagal)
+        r = await self.executor.run(
+            "ip addr | grep inet6 | grep -v 'fe80:' | wc -l",
+            module="provisioner", check=False,
+        )
+        ipv6_count = int(r["stdout"].strip() or 0)
+        if ipv6_count > 0:
+            logger.info("IPv6 support detected")
+            return True
+
+        logger.warning("No IPv6 addresses found — disabling IPv6 in Nginx")
+        return False
+
     async def install_lemp(self) -> str:
         """Full LEMP stack installation."""
         await self.notifier.send("🚀 *Memulai instalasi LEMP stack...*")
