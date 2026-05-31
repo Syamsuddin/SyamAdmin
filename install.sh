@@ -48,18 +48,27 @@ check_os() {
 }
 
 install_system_deps() {
+    # Cegah prompt interaktif (mis. postfix dari rkhunter) yang membuat installer
+    # tampak "hang" karena menunggu input. noninteractive = pakai jawaban default.
+    export DEBIAN_FRONTEND=noninteractive
+
     log_info "Mengupdate package list..."
     apt-get update -qq
 
-    log_info "Menginstall system dependencies..."
-    apt-get install -y -qq \
+    log_info "Menginstall system dependencies (noninteractive)..."
+    # --no-install-recommends: hindari menarik MTA (postfix) yang tak diperlukan.
+    # confdef/confold: jawab otomatis bila ada prompt berkas konfigurasi.
+    # Output TIDAK lagi dibuang ke /dev/null agar progres & error terlihat.
+    apt-get install -y \
+        --no-install-recommends \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
         python3 python3-pip python3-venv \
         curl wget git unzip jq \
         sqlite3 \
         htop iotop nethogs \
         rkhunter lynis \
-        cron logrotate \
-        > /dev/null 2>&1
+        cron logrotate
 
     log_info "System dependencies terinstall."
 }
