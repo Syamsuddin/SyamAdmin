@@ -502,13 +502,35 @@ class SyamAdminBot:
             await msg.edit_text(result["message"], parse_mode="Markdown")
             return
 
+        # P0 #3: Perintah shell bebas dari AI WAJIB konfirmasi OTP ketat.
+        # Keputusan model (confirmation_needed) tidak boleh melewati gerbang ini —
+        # safety filter statis saja tidak cukup untuk perintah destruktif yang
+        # tak masuk blocklist (mis. `systemctl stop mysql`, `truncate -s 0 ...`).
+        forced_otp = (
+            result.get("module") == "executor"
+            and result.get("action") == "run_command"
+        )
+        if forced_otp:
+            result["confirmation_needed"] = True
+
         if result.get("confirmation_needed"):
             otp = self._generate_otp()
+            # Tampilkan perintah shell yang akan dijalankan agar admin tahu
+            # persis apa yang ia setujui sebelum mengetik OTP.
+            action_detail = f"`{result['module']}.{result['action']}`"
+            cmd_preview = (result.get("params") or {}).get("command")
+            if cmd_preview:
+                action_detail += f"\nPerintah: `{cmd_preview}`"
+            risk_note = (
+                "\n\n🔐 *Aksi berisiko* — balasan `ya/ok` tidak berlaku, "
+                "wajib kirim kode OTP."
+                if forced_otp else ""
+            )
             await msg.edit_text(
                 f"⚠️ *Konfirmasi Diperlukan*\n\n"
                 f"Intent: {result['intent']}\n"
-                f"Aksi: `{result['module']}.{result['action']}`\n\n"
-                f"{result['message']}\n\n"
+                f"Aksi: {action_detail}\n\n"
+                f"{result['message']}{risk_note}\n\n"
                 f"Kirim `/confirm {otp}` untuk mengeksekusi (berlaku 60 detik).",
                 parse_mode="Markdown",
             )
@@ -516,6 +538,7 @@ class SyamAdminBot:
                 "action": "ai",
                 "result": result,
                 "otp": otp,
+                "destructive": forced_otp,
                 "expires": datetime.now().timestamp() + 60,
             }
             return
@@ -706,6 +729,7 @@ class SyamAdminBot:
             is_affirmative = (
                 user_text in AFFIRMATIVE_WORDS
                 and pending["action"] not in DESTRUCTIVE_ACTIONS
+                and not pending.get("destructive")
             )
             if is_otp or is_affirmative:
                 del self._pending_confirmations[self.admin_id]

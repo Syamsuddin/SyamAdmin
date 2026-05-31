@@ -66,12 +66,16 @@ class Notifier:
         module: str,
         message: str,
         cooldown: bool = True,
+        dedup_key: str | None = None,
     ) -> bool:
         """
         Send an alert with deduplication cooldown.
         severity: critical, warning, info
+        dedup_key: kunci stabil untuk cooldown. Jika None, pakai potongan pesan.
+            WAJIB diisi untuk alert dengan nilai dinamis (mis. persentase CPU),
+            agar cooldown tidak terus tereset oleh nilai yang berubah-ubah.
         """
-        alert_key = f"{module}:{message[:50]}"
+        alert_key = f"{module}:{dedup_key or message[:50]}"
 
         if cooldown and alert_key in self._last_alert:
             elapsed = (datetime.now() - self._last_alert[alert_key]).total_seconds()

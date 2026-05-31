@@ -133,28 +133,32 @@ class SystemMonitor:
             await self.notifier.alert(
                 "warning", "monitor",
                 f"CPU tinggi: *{metrics['cpu_percent']}%*\n"
-                f"Top proses:\n```\n{top['stdout']}\n```"
+                f"Top proses:\n```\n{top['stdout']}\n```",
+                dedup_key="cpu_high",
             )
 
         if metrics["ram_percent"] > self.thresholds["ram"]:
             await self.notifier.alert(
                 "warning", "monitor",
                 f"RAM tinggi: *{metrics['ram_percent']}%* "
-                f"({metrics['ram_used_gb']}/{metrics['ram_total_gb']} GB)"
+                f"({metrics['ram_used_gb']}/{metrics['ram_total_gb']} GB)",
+                dedup_key="ram_high",
             )
 
         if metrics["disk_percent"] > self.thresholds["disk"]:
             await self.notifier.alert(
                 "critical", "monitor",
                 f"Disk hampir penuh: *{metrics['disk_percent']}%* "
-                f"({metrics['disk_used_gb']}/{metrics['disk_total_gb']} GB)"
+                f"({metrics['disk_used_gb']}/{metrics['disk_total_gb']} GB)",
+                dedup_key="disk_high",
             )
 
         if metrics["load_1"] > self.thresholds["load"]:
             await self.notifier.alert(
                 "warning", "monitor",
                 f"Load average tinggi: *{metrics['load_1']}* "
-                f"(threshold: {self.thresholds['load']})"
+                f"(threshold: {self.thresholds['load']})",
+                dedup_key="load_high",
             )
 
     async def _check_single_service(self, svc: str):
@@ -202,6 +206,7 @@ class SystemMonitor:
                     f"Status: `{status_text}`"
                     f"{diagnose_msg}",
                     cooldown=True,
+                    dedup_key=f"service_down:{svc}",
                 )
 
     async def _check_services(self):
