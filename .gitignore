@@ -17,3 +17,10 @@ config.env
 
 # OS
 .DS_Store
+
+# Dev & AI Tools
+TASK_PLAN.md
+TASK_PLAN_UPDATE.md
+CLAUDE.md
+.claude/
+git_push.sh
