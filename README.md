@@ -172,18 +172,33 @@ Agen kini ber-memori, bukan sekadar reaktif:
 
 ### Installation
 
-```bash
-# 1. Unggah tarball ke VPS
-scp syamadmin.tar.gz root@IP_SERVER_ANDA:~/
+**Opsi A — Unduh langsung dari GitHub di server (paling cepat):**
 
-# 2. SSH masuk ke server, ekstrak, dan jalankan installer
+```bash
+# 1. SSH ke server, buat folder kerja, lalu unduh tarball dari repo
 ssh root@IP_SERVER_ANDA
-tar xzf syamadmin.tar.gz && cd syamadmin
+mkdir -p ~/syamadmin && cd ~/syamadmin
+wget https://raw.githubusercontent.com/Syamsuddin/SyamAdmin/main/syamadmin.tar.gz
+# alternatif: curl -LO https://raw.githubusercontent.com/Syamsuddin/SyamAdmin/main/syamadmin.tar.gz
+
+# 2. Ekstrak (arsip flat → file langsung di folder ini) & jalankan installer
+tar xzf syamadmin.tar.gz
 chmod +x install.sh
 sudo ./install.sh
 
 # 3. Konfigurasi kredensial (Wajib sebelum memulai)
 sudo nano /etc/syamadmin/config.env
+```
+
+> Catatan: metode `wget` di atas berlaku untuk repo **publik**. Jika repo privat,
+> gunakan `git clone https://<TOKEN>@github.com/Syamsuddin/SyamAdmin.git` atau salin via `scp` (Opsi B).
+
+**Opsi B — Build lokal lalu salin via `scp`:**
+
+```bash
+# Dari komputer lokal (lihat perintah build tarball di CLAUDE.md):
+scp syamadmin.tar.gz root@IP_SERVER_ANDA:~/syamadmin/
+# lalu di server: cd ~/syamadmin && tar xzf syamadmin.tar.gz && sudo ./install.sh
 ```
 
 Isi variabel utama di dalam config file:
