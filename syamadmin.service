@@ -1,0 +1,22 @@
+[Unit]
+Description=SyamAdmin AI Sysadmin Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/syamadmin
+EnvironmentFile=/etc/syamadmin/config.env
+ExecStart=/opt/syamadmin/venv/bin/python3 /opt/syamadmin/syamadmin.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/syamadmin/agent.log
+StandardError=append:/var/log/syamadmin/agent.log
+
+# Limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
