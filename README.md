@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="img/header.jpg" alt="SyamAdmin Header" width="100%">
+  <img src="img/syamadmin.png" alt="SyamAdmin Header" width="100%">
 </p>
 
 <p align="center">
