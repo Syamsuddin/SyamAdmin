@@ -765,22 +765,187 @@ class PreEmptiveFirewall:
         baseline = self._load_baseline()
         self._update_baseline(aggregated)
 
-        # Deteksi anomali
+        # Layer 4: Deteksi anomali rule-based
         threats = self._detect_anomalies(aggregated, baseline)
         self._save_threats(threats)
 
-        # Notifikasi ke Telegram untuk ancaman HIGH/CRITICAL (Sprint 4: + AI analysis)
-        critical = [t for t in threats if t.severity in ("HIGH", "CRITICAL")]
-        if critical:
-            await self._notify_threats(critical)
+        new_high = [t for t in threats if t.severity in ("HIGH", "CRITICAL")]
+
+        # Layer 4 (AI): Analisis ancaman pending dengan Claude
+        pending = self._get_pending_threats()
+        if pending:
+            decisions = await self._analyze_with_ai(pending)
+            if decisions:
+                await self._apply_decisions(decisions)
+        elif new_high:
+            # Jika AI tidak aktif, tetap notif ancaman baru
+            await self._notify_threats(new_high)
 
         self._prune_old_data()
 
         logger.info(
-            f"PeFi tick: {len(aggregated)} IP, "
+            f"PeFi tick: {len(aggregated)} IP dipantau, "
             f"{len(threats)} ancaman baru "
-            f"({len(critical)} HIGH/CRITICAL)"
+            f"({len(new_high)} HIGH/CRITICAL), "
+            f"{len(pending)} dianalisis AI"
         )
+
+    # ------------------------------------------------------------------
+    # LAYER 4 (lanjutan): DECISION ENGINE + ACTION ENGINE
+    # ------------------------------------------------------------------
+
+    async def _analyze_with_ai(self, pending: list[dict]) -> list[dict]:
+        """
+        Kirim ancaman pending ke Claude untuk verdict.
+        Jika AI tidak aktif → return keputusan konservatif (MONITOR semua).
+        """
+        if not pending:
+            return []
+        if not self.brain or not getattr(self.brain, "enabled", False):
+            logger.info("PeFi: AI Brain tidak aktif, default MONITOR untuk semua ancaman.")
+            return [
+                {
+                    "threat_id": t["id"], "ip": t["ip"],
+                    "verdict": "MONITOR", "confidence": 0.4,
+                    "block_duration_hours": 0,
+                    "reason": "AI tidak aktif — pantau saja.",
+                    "risk_if_wrong": "Tidak ada aksi otomatis.",
+                }
+                for t in pending
+            ]
+
+        # Ambil konteks server dari monitor jika tersedia
+        server_ctx = (
+            "Layanan aktif: Nginx, MySQL, PHP-FPM, Fail2Ban, UFW, SSH. "
+            "Port terbuka: 22, 80, 443."
+        )
+
+        return await self.brain.analyze_pefi_threats(pending, server_ctx)
+
+    def _update_threat_status(
+        self, threat_id: int, verdict: str, confidence: float, reason: str, action: str
+    ):
+        """Update status keputusan AI di tabel pefi_threats."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                """UPDATE pefi_threats
+                   SET ai_verdict=?, confidence=?, ai_reason=?, action_taken=?
+                   WHERE id=?""",
+                (verdict, confidence, reason, action, threat_id),
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"PeFi update threat status error: {e}")
+
+    async def _auto_block_ip(
+        self, ip: str, duration_hours: int, threat_id: int, reason: str
+    ):
+        """Eksekusi blokir UFW untuk Tier 1 (auto-block)."""
+        try:
+            comment = f"PeFi auto-block: {reason[:80]}"
+            await self.firewall.deny_ip(ip, comment=comment)
+
+            # Simpan ke pefi_rules
+            conn = sqlite3.connect(self.db_path)
+            expires_sql = (
+                f"datetime('now', '+{duration_hours} hours')"
+                if duration_hours and duration_hours > 0
+                else "NULL"
+            )
+            conn.execute(
+                f"""INSERT OR REPLACE INTO pefi_rules
+                    (ip, rule_type, duration_hours, expires_at, reason, threat_id, active)
+                    VALUES (?,?,?,{expires_sql},?,?,1)""",
+                (ip, "block", duration_hours or None, reason[:200], threat_id),
+            )
+            conn.commit()
+            conn.close()
+
+            dur_str = f"{duration_hours} jam" if duration_hours else "permanen"
+            logger.info(f"PeFi auto-block: {ip} diblokir {dur_str} — {reason}")
+            return True
+        except Exception as e:
+            logger.error(f"PeFi auto-block error untuk {ip}: {e}")
+            return False
+
+    async def _apply_decisions(self, decisions: list[dict]):
+        """
+        Terapkan keputusan AI ke setiap ancaman.
+
+        Tier 0 — IGNORE     : confidence rendah / false positive — abaikan
+        Tier 1 — AUTO-BLOCK : confidence >= AUTO_BLOCK_CONFIDENCE AND BLOCK → eksekusi langsung
+        Tier 2 — CONFIRM    : BLOCK tapi confidence kurang → notif Telegram, tunggu admin
+        Tier 3 — MONITOR    : MONITOR/THROTTLE → catat, pantau
+
+        THROTTLE saat ini diperlakukan sama dengan MONITOR (Sprint 4: iptables rate limit).
+        """
+        auto_block_enabled = (
+            self.config.get("PEFI_AUTO_BLOCK", "false").lower() == "true"
+        )
+        auto_block_conf = float(
+            self.config.get("PEFI_AUTO_BLOCK_CONFIDENCE", 0.95)
+        )
+
+        for d in decisions:
+            threat_id = d.get("threat_id")
+            ip = d.get("ip", "")
+            verdict = d.get("verdict", "MONITOR").upper()
+            confidence = float(d.get("confidence", 0.5))
+            reason = d.get("reason", "")
+            duration_h = int(d.get("block_duration_hours") or 24)
+
+            if not threat_id or not ip:
+                continue
+
+            # Tier 0: IGNORE
+            if verdict == "IGNORE":
+                self._update_threat_status(threat_id, verdict, confidence, reason, "ignored")
+                logger.info(f"PeFi IGNORE: {ip} (conf={confidence:.2f}) — {reason}")
+                continue
+
+            # Tier 3: MONITOR / THROTTLE
+            if verdict in ("MONITOR", "THROTTLE"):
+                self._update_threat_status(threat_id, verdict, confidence, reason, "monitoring")
+                logger.info(f"PeFi MONITOR: {ip} (conf={confidence:.2f}) — {reason}")
+                continue
+
+            # Tier 1: AUTO-BLOCK (jika diaktifkan dan confidence cukup tinggi)
+            if verdict == "BLOCK" and auto_block_enabled and confidence >= auto_block_conf:
+                success = await self._auto_block_ip(ip, duration_h, threat_id, reason)
+                action = "blocked" if success else "block_failed"
+                self._update_threat_status(threat_id, verdict, confidence, reason, action)
+                if success:
+                    await self.notifier.send(
+                        f"🛡️ *PeFi Auto-Block*\n\n"
+                        f"• IP: `{ip}`\n"
+                        f"• Alasan: {reason}\n"
+                        f"• Durasi: {duration_h} jam\n"
+                        f"• Keyakinan AI: {confidence:.0%}\n\n"
+                        f"_Ketik `/pefi unblock {ip}` untuk membatalkan._"
+                    )
+                continue
+
+            # Tier 2: BLOCK tapi butuh konfirmasi admin
+            if verdict == "BLOCK":
+                self._update_threat_status(
+                    threat_id, verdict, confidence, reason, "awaiting_confirm"
+                )
+                dur_str = f"{duration_h} jam" if duration_h else "permanen"
+                await self.notifier.send(
+                    f"⚠️ *PeFi — Konfirmasi Blokir*\n\n"
+                    f"• IP: `{ip}`\n"
+                    f"• Alasan: {reason}\n"
+                    f"• Durasi usulan: {dur_str}\n"
+                    f"• Keyakinan AI: {confidence:.0%}\n\n"
+                    f"Untuk memblokir: `/pefi block {ip}`\n"
+                    f"Untuk abaikan: `/pefi ignore {threat_id}`"
+                )
+                logger.info(
+                    f"PeFi AWAITING: {ip} (conf={confidence:.2f}) — "
+                    f"notif dikirim ke admin"
+                )
 
     async def _notify_threats(self, threats: list[ThreatEvent]):
         """Kirim ringkasan ancaman HIGH/CRITICAL ke Telegram admin."""
@@ -957,6 +1122,75 @@ class PreEmptiveFirewall:
             return "✅ PeFi scan manual selesai. Data traffic terbaru tersimpan di database."
         except Exception as e:
             return f"❌ Scan manual gagal: {e}"
+
+    async def approve_block(self, ip: str, duration_hours: int = 24) -> str:
+        """Admin konfirmasi blokir IP yang sedang awaiting_confirm."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            threat = conn.execute(
+                """SELECT id, ai_reason FROM pefi_threats
+                   WHERE ip=? AND action_taken='awaiting_confirm'
+                   ORDER BY detected_at DESC LIMIT 1""",
+                (ip,),
+            ).fetchone()
+            conn.close()
+            if not threat:
+                return f"ℹ️ Tidak ada ancaman pending untuk IP `{ip}`."
+            threat_id, reason = threat
+            success = await self._auto_block_ip(
+                ip, duration_hours, threat_id,
+                reason or "Dikonfirmasi manual oleh admin",
+            )
+            if success:
+                self._update_threat_status(threat_id, "BLOCK", 1.0, reason, "blocked")
+                return (
+                    f"✅ `{ip}` berhasil diblokir {duration_hours} jam.\n"
+                    f"_Ketik `/pefi unblock {ip}` untuk membatalkan._"
+                )
+            return f"❌ Gagal memblokir `{ip}`."
+        except Exception as e:
+            return f"❌ Error: {e}"
+
+    async def ignore_threat(self, threat_id: int) -> str:
+        """Admin tandai ancaman sebagai false positive."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute(
+                "UPDATE pefi_threats SET action_taken='ignored', false_positive=1 WHERE id=?",
+                (threat_id,),
+            )
+            conn.commit()
+            conn.close()
+            return f"✅ Ancaman ID `{threat_id}` ditandai sebagai false positive dan diabaikan."
+        except Exception as e:
+            return f"❌ Error: {e}"
+
+    async def get_report(self, hours: int = 24) -> str:
+        """Laporan ringkasan aktivitas PeFi dalam N jam terakhir."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                f"""SELECT threat_type, severity, action_taken, COUNT(*) as n
+                    FROM pefi_threats
+                    WHERE detected_at > datetime('now', '-{hours} hours')
+                    GROUP BY threat_type, severity, action_taken
+                    ORDER BY n DESC""",
+            ).fetchall()
+            blocked = conn.execute(
+                f"""SELECT COUNT(*) FROM pefi_rules
+                    WHERE active=1 AND created_at > datetime('now', '-{hours} hours')"""
+            ).fetchone()[0]
+            conn.close()
+            if not rows:
+                return f"✅ Tidak ada aktivitas PeFi dalam {hours} jam terakhir."
+            icons = {"CRITICAL": "💀", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵"}
+            lines = [f"📊 *Laporan PeFi ({hours} jam terakhir)*\n"]
+            for ttype, sev, action, n in rows:
+                lines.append(f"{icons.get(sev,'⚪')} {ttype} [{sev}] → `{action}` × {n}")
+            lines.append(f"\n🔒 Blokir baru diterapkan: `{blocked}`")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"❌ Gagal buat laporan: {e}"
 
     # ------------------------------------------------------------------
     # HELPERS

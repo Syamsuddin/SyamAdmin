@@ -146,6 +146,65 @@ Jarwo — jujur, tidak menakut-nakuti, tapi pastikan admin paham.
 Jika perintah tidak jelas, JANGAN panggil tool — tanya balik dengan santai khas Jarwo.
 """
 
+# Tool khusus PeFi — analisis ancaman jaringan dan keputusan blokir
+PEFI_ANALYSIS_TOOL = {
+    "name": "analyze_network_threats",
+    "description": (
+        "Jarwo menganalisis daftar anomali traffic jaringan yang terdeteksi PeFi "
+        "dan memutuskan tindakan terbaik untuk setiap IP mencurigakan. "
+        "Pertimbangkan konteks server, riwayat IP, jenis ancaman, dan dampak "
+        "jika keputusan salah (false positive vs membiarkan serangan)."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "decisions": {
+                "type": "array",
+                "description": "Satu keputusan untuk setiap threat yang dianalisis",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "threat_id": {"type": "integer", "description": "ID dari tabel pefi_threats"},
+                        "ip": {"type": "string", "description": "Alamat IP yang dianalisis"},
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["BLOCK", "THROTTLE", "MONITOR", "IGNORE"],
+                            "description": (
+                                "BLOCK: blokir IP via UFW. "
+                                "THROTTLE: batasi rate koneksi. "
+                                "MONITOR: pantau saja, belum perlu aksi. "
+                                "IGNORE: kemungkinan false positive, abaikan."
+                            ),
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "description": "Tingkat keyakinan keputusan (0.0-1.0)",
+                        },
+                        "block_duration_hours": {
+                            "type": "integer",
+                            "description": "Durasi blokir dalam jam. 0 = permanen. Kosongkan jika bukan BLOCK.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Penjelasan singkat alasan keputusan dalam bahasa Indonesia",
+                        },
+                        "risk_if_wrong": {
+                            "type": "string",
+                            "description": "Dampak jika keputusan ini salah (false positive atau false negative)",
+                        },
+                    },
+                    "required": ["threat_id", "ip", "verdict", "confidence", "reason"],
+                },
+            },
+            "summary": {
+                "type": "string",
+                "description": "Ringkasan situasi keamanan untuk dikirim ke admin via Telegram",
+            },
+        },
+        "required": ["decisions", "summary"],
+    },
+}
+
 # Definisi tool untuk native tool-use (#2): menggantikan parsing JSON-dalam-teks
 # yang rapuh. Model dipaksa menghasilkan struktur valid; module dibatasi enum.
 DISPATCH_TOOL = {
@@ -830,6 +889,87 @@ class AIBrain:
         except Exception as e:
             self.last_error = str(e)
             return f"Gagal menganalisis keamanan: {e}"
+
+    async def analyze_pefi_threats(
+        self, threats: list[dict], server_context: str = ""
+    ) -> list[dict]:
+        """
+        Analisis ancaman jaringan dari PeFi menggunakan native tool-use.
+
+        Args:
+            threats: list dari _get_pending_threats() —
+                     [{id, ip, threat_type, severity, details}, ...]
+            server_context: string konteks server (layanan aktif, port, dll)
+
+        Returns:
+            list keputusan [{threat_id, ip, verdict, confidence,
+                             block_duration_hours, reason, risk_if_wrong}, ...]
+            Kosong jika AI tidak aktif atau gagal.
+        """
+        if not self.enabled or not threats:
+            return []
+
+        # Susun ringkasan ancaman untuk prompt
+        threat_lines = []
+        for t in threats:
+            det = t.get("details", {})
+            detail_str = ", ".join(f"{k}={v}" for k, v in det.items() if v)
+            threat_lines.append(
+                f"- ID={t['id']} IP={t['ip']} Jenis={t['threat_type']} "
+                f"Severity={t['severity']} | {detail_str}"
+            )
+
+        prompt = (
+            f"Konteks server:\n{server_context or 'Tidak ada konteks tambahan.'}\n\n"
+            f"Ancaman terdeteksi PeFi ({len(threats)} item):\n"
+            + "\n".join(threat_lines)
+            + "\n\nAnalisis setiap ancaman dan berikan keputusan yang tepat."
+        )
+
+        fallback = [
+            {
+                "threat_id": t["id"], "ip": t["ip"],
+                "verdict": "MONITOR", "confidence": 0.5,
+                "block_duration_hours": 0,
+                "reason": "AI tidak aktif — default: pantau saja.",
+                "risk_if_wrong": "Tidak ada aksi otomatis.",
+            }
+            for t in threats
+        ]
+
+        try:
+            client = self._get_client()
+            response = await client.messages.create(
+                model=self.model,
+                max_tokens=1536,
+                system=[{
+                    "type": "text",
+                    "text": SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                tools=[PEFI_ANALYSIS_TOOL],
+                tool_choice={"type": "tool", "name": "analyze_network_threats"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+            self.last_error = None
+            self._log_usage("pefi_analyze_threats", response)
+
+            for block in response.content:
+                if getattr(block, "type", None) == "tool_use":
+                    inp = block.input or {}
+                    decisions = inp.get("decisions", [])
+                    logger.info(
+                        f"PeFi AI: {len(decisions)} keputusan diterima "
+                        f"| summary: {inp.get('summary','')[:80]}"
+                    )
+                    return decisions
+
+            return fallback
+
+        except Exception as e:
+            self.last_error = str(e)
+            logger.error(f"PeFi AI analysis error: {e}")
+            return fallback
 
     async def explain_error(self, operation: str, stderr: str) -> str:
         """Ubah pesan error teknis jadi penjelasan ramah-pemula + langkah perbaikan."""
