@@ -155,6 +155,61 @@ class SiteManager:
         logger.warning("No IPv6 addresses detected — IPv4-only Nginx config")
         return False
 
+    async def _strip_ipv6_from_configs(self):
+        """Remove listen [::] directives from all nginx config files."""
+        for path in (
+            "/etc/nginx/sites-available/*",
+            "/etc/nginx/sites-enabled/*",
+            "/etc/nginx/conf.d/*.conf",
+        ):
+            await self.executor.run(
+                f"sed -i '/listen \\[::]/d' {path} 2>/dev/null || true",
+                module="site_manager", check=False,
+            )
+
+    async def _attempt_nginx_fix(self, stderr: str) -> bool:
+        """Pattern-match a known nginx error and apply a targeted fix.
+
+        Returns True if a fix was applied (caller should re-test).
+        """
+        s = stderr.lower()
+
+        if "address family not supported" in s or "[::]:80" in s or "[::]:443" in s:
+            await self._strip_ipv6_from_configs()
+            return True
+
+        if "duplicate default server" in s:
+            await self.executor.run(
+                "rm -f /etc/nginx/sites-enabled/default",
+                module="site_manager", check=False,
+            )
+            return True
+
+        if "no such file" in s or "is not a directory" in s:
+            await self.executor.run(
+                "mkdir -p /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/sites-available",
+                module="site_manager", check=False,
+            )
+            return True
+
+        if "already in use" in s:
+            await self.executor.run(
+                "systemctl stop apache2 2>/dev/null; "
+                "systemctl disable apache2 2>/dev/null || true",
+                module="site_manager", check=False,
+            )
+            return True
+
+        # PHP-FPM socket not found
+        if "connect() to unix:" in s and "fpm" in s:
+            await self.executor.run(
+                f"systemctl restart php{self.php_version}-fpm",
+                module="site_manager", check=False,
+            )
+            return True
+
+        return False
+
     async def add_site(self, domain: str, root_path: str = "", framework: str = "default") -> str:
         """Add a new Nginx vhost for a domain."""
         if not root_path:
@@ -207,10 +262,25 @@ class SiteManager:
             module="site_manager",
         )
 
-        # Test and reload
-        test = await self.executor.run("nginx -t", module="site_manager")
-        if not test["success"]:
-            # Rollback
+        # Test → diagnose → fix → retry loop
+        nginx_ok = False
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            test = await self.executor.run("nginx -t 2>&1", module="site_manager", check=False)
+            if test["success"]:
+                nginx_ok = True
+                break
+            stderr = (test.get("stderr", "") + " " + test.get("stdout", "")).strip()
+            logger.warning(f"nginx -t failed for {domain} (attempt {attempt}/{max_attempts}): {stderr[:300]}")
+            if attempt < max_attempts:
+                fixed = await self._attempt_nginx_fix(stderr)
+                if not fixed:
+                    break
+                await self.notifier.send(
+                    f"🔧 Auto-fix nginx diterapkan (percobaan {attempt}/{max_attempts}), menguji ulang..."
+                )
+
+        if not nginx_ok:
             await self.executor.run(
                 f"rm -f /etc/nginx/sites-enabled/{domain} {config_path}",
                 module="site_manager",
@@ -290,8 +360,38 @@ class SiteManager:
         return "\n".join(lines)
 
     async def enable_ssl(self, domain: str) -> str:
-        """Enable SSL via Let's Encrypt Certbot."""
+        """Enable SSL via Let's Encrypt Certbot with pre-checks and diagnosis."""
         await self.notifier.send(f"🔒 *Enabling SSL for `{domain}`...*")
+
+        # Pre-check 1: certbot installed?
+        cb = await self.executor.run("which certbot", module="site_manager", check=False)
+        if not cb["success"]:
+            await self.notifier.send("ℹ️ Certbot belum terinstall, menginstall...")
+            await self.executor.run(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot python3-certbot-nginx",
+                module="site_manager", timeout=120, check=False,
+            )
+
+        # Pre-check 2: port 80 open in firewall?
+        ufw = await self.executor.run(
+            "ufw status 2>/dev/null | grep '80/tcp' | grep -i allow",
+            module="site_manager", check=False,
+        )
+        if not ufw["stdout"].strip():
+            await self.notifier.send("ℹ️ Port 80 belum dibuka di firewall, membuka...")
+            await self.executor.run(
+                "ufw allow 80/tcp 2>/dev/null || true",
+                module="site_manager", check=False,
+            )
+
+        # Pre-check 3: nginx running?
+        nginx_active = await self.executor.run(
+            "systemctl is-active nginx", module="site_manager", check=False,
+        )
+        if nginx_active["stdout"].strip() != "active":
+            await self.executor.run(
+                "systemctl start nginx", module="site_manager", check=False,
+            )
 
         r = await self.executor.run(
             f"certbot --nginx -d {domain} -d www.{domain} "
@@ -300,8 +400,9 @@ class SiteManager:
             module="site_manager", timeout=120,
         )
 
-        if r["success"] or "congratulations" in r["stdout"].lower():
-            # Update database
+        output = (r.get("stdout", "") + " " + r.get("stderr", "")).strip()
+
+        if r["success"] or "congratulations" in output.lower():
             try:
                 conn = sqlite3.connect(self.db_path)
                 conn.execute("UPDATE sites SET ssl_enabled=1 WHERE domain=?", (domain,))
@@ -310,7 +411,6 @@ class SiteManager:
             except Exception:
                 pass
 
-            # Setup auto-renewal cron
             await self.executor.run(
                 "systemctl enable --now certbot.timer 2>/dev/null || "
                 "(crontab -l 2>/dev/null; echo '0 3 * * * certbot renew --quiet') | sort -u | crontab -",
@@ -324,10 +424,34 @@ class SiteManager:
                 f"• HTTP → HTTPS redirect: active"
             )
         else:
-            msg = f"❌ SSL setup gagal:\n```\n{r['stderr'][:500]}\n```\n\n_Pastikan domain sudah mengarah ke IP server ini._"
+            diagnosis = self._diagnose_certbot_failure(output)
+            msg = (
+                f"❌ SSL setup gagal:\n```\n{output[:500]}\n```"
+                f"\n\n💡 *Kemungkinan penyebab:*\n{diagnosis}"
+            )
 
         await self.notifier.send(msg)
         return msg
+
+    @staticmethod
+    def _diagnose_certbot_failure(output: str) -> str:
+        """Pattern-match certbot errors into actionable guidance."""
+        s = output.lower()
+        hints = []
+        if "dns" in s or "could not resolve" in s or "name or service not known" in s:
+            hints.append("• DNS domain belum mengarah ke IP server ini. Cek A record di panel DNS.")
+        if "connection refused" in s or "port 80" in s:
+            hints.append("• Port 80 tidak bisa dijangkau. Pastikan firewall dan nginx aktif.")
+        if "too many" in s or "rate limit" in s:
+            hints.append("• Rate limit Let's Encrypt tercapai. Tunggu 1 jam dan coba lagi.")
+        if "unauthorized" in s or "403" in s:
+            hints.append("• Challenge gagal. Pastikan web root accessible dan tidak diblokir (.htaccess/nginx deny).")
+        if "no match" in s or "server_name" in s:
+            hints.append("• Nginx config untuk domain ini tidak ditemukan. Pastikan site sudah di-add.")
+        if not hints:
+            hints.append("• Pastikan domain sudah mengarah ke IP server ini (A record).")
+            hints.append("• Pastikan nginx aktif dan port 80 terbuka.")
+        return "\n".join(hints)
 
     async def _create_php_pool(self, domain: str):
         """Create a per-site PHP-FPM pool for isolation."""

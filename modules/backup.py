@@ -22,12 +22,27 @@ class BackupManager:
         await self.executor.run(f"mkdir -p {self.backup_dir}/db {self.backup_dir}/files", module="backup")
 
     async def backup_db(self) -> str:
-        """Backup all MySQL databases."""
+        """Backup all MySQL databases. Auto-starts MySQL if not running."""
         await self._ensure_dir()
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{self.backup_dir}/db/all_databases_{ts}.sql.gz"
 
         await self.notifier.send("💾 *Backing up databases...*")
+
+        # Pre-check: MySQL running?
+        check = await self.executor.run(
+            "systemctl is-active mysql", module="backup", check=False,
+        )
+        if check["stdout"].strip() != "active":
+            await self.notifier.send("⚠️ MySQL tidak aktif, mencoba start...")
+            await self.executor.run(
+                "systemctl start mysql", module="backup", timeout=60, check=False,
+            )
+            recheck = await self.executor.run(
+                "systemctl is-active mysql", module="backup", check=False,
+            )
+            if recheck["stdout"].strip() != "active":
+                return "❌ Database backup gagal: MySQL tidak bisa dijalankan. Cek `journalctl -u mysql`."
 
         r = await self.executor.run(
             f"mysqldump --all-databases --single-transaction --routines --triggers "
@@ -36,6 +51,14 @@ class BackupManager:
         )
 
         if r["success"]:
+            # Verify dump file is not empty (gzip of empty stream is ~20 bytes)
+            sz = await self.executor.run(f"stat -c%s {filename} 2>/dev/null || echo 0", module="backup", check=False)
+            file_size = int(sz["stdout"].strip() or "0")
+            if file_size < 100:
+                return (
+                    "⚠️ Backup selesai tapi file sangat kecil — kemungkinan mysqldump gagal diam-diam.\n"
+                    "Cek akses MySQL: `mysql -e 'SHOW DATABASES;'`"
+                )
             size = await self.executor.run(f"du -h {filename} | cut -f1", module="backup")
             msg = f"✅ *Database backup selesai*\n📁 `{filename}`\n📦 Size: `{size['stdout'].strip()}`"
         else:

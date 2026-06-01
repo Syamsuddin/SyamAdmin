@@ -16,8 +16,51 @@ class SecurityManager:
         self.notifier = notifier
         self.ssh_port = int(os.environ.get("SSH_PORT", 22))
 
+    async def _attempt_sshd_fix(self, stderr: str) -> bool:
+        """Pattern-match a known sshd config error and apply a targeted fix.
+
+        Returns True if a fix was applied (caller should re-test).
+        """
+        s = stderr.lower()
+
+        # Missing config.d directory
+        if "no such file" in s and "sshd_config.d" in s:
+            await self.executor.run(
+                "mkdir -p /etc/ssh/sshd_config.d",
+                module="security", check=False,
+            )
+            return True
+
+        # Duplicate or conflicting directives from other drop-in files
+        if "duplicate" in s or "bad configuration" in s:
+            await self.executor.run(
+                "find /etc/ssh/sshd_config.d/ -name '*.conf' "
+                "! -name '99-syamadmin.conf' -delete 2>/dev/null || true",
+                module="security", check=False,
+            )
+            return True
+
+        # Missing privilege separation directory
+        if "missing privilege separation directory" in s or "/run/sshd" in s:
+            await self.executor.run(
+                "mkdir -p /run/sshd && chmod 0755 /run/sshd",
+                module="security", check=False,
+            )
+            return True
+
+        # Unsupported option (e.g. ChallengeResponseAuthentication on newer Ubuntu)
+        if "unsupported option" in s or "deprecated option" in s:
+            await self.executor.run(
+                "sed -i '/ChallengeResponseAuthentication/d' "
+                "/etc/ssh/sshd_config.d/99-syamadmin.conf 2>/dev/null || true",
+                module="security", check=False,
+            )
+            return True
+
+        return False
+
     async def harden_ssh(self) -> str:
-        """Apply SSH hardening configuration."""
+        """Apply SSH hardening configuration with self-healing."""
         await self.notifier.send("🔐 *Hardening SSH...*")
 
         sshd_hardening = f"""
@@ -41,6 +84,12 @@ LoginGraceTime 30
 AllowAgentForwarding no
 AllowTcpForwarding no
 """
+        # Ensure config.d directory exists
+        await self.executor.run(
+            "mkdir -p /etc/ssh/sshd_config.d",
+            module="security", check=False,
+        )
+
         # Backup original
         await self.executor.run(
             "cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%s)",
@@ -54,9 +103,25 @@ AllowTcpForwarding no
             module="security",
         )
 
-        # Test and reload
-        test = await self.executor.run("sshd -t", module="security")
-        if test["success"]:
+        # Test → diagnose → fix → retry loop
+        sshd_ok = False
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            test = await self.executor.run("sshd -t 2>&1", module="security", check=False)
+            if test["success"]:
+                sshd_ok = True
+                break
+            stderr = (test.get("stderr", "") + " " + test.get("stdout", "")).strip()
+            logger.warning(f"sshd -t failed (attempt {attempt}/{max_attempts}): {stderr[:300]}")
+            if attempt < max_attempts:
+                fixed = await self._attempt_sshd_fix(stderr)
+                if not fixed:
+                    break
+                await self.notifier.send(
+                    f"🔧 Auto-fix SSH diterapkan (percobaan {attempt}/{max_attempts}), menguji ulang..."
+                )
+
+        if sshd_ok:
             await self.executor.run("systemctl reload sshd", module="security")
             msg = (
                 f"✅ *SSH Hardened*\n"
@@ -67,13 +132,17 @@ AllowTcpForwarding no
                 f"• Idle timeout: 5 min"
             )
         else:
-            msg = f"❌ SSH config test gagal:\n```\n{test['stderr'][:500]}\n```"
+            # Restore: remove our broken config so sshd stays functional
+            await self.executor.run(
+                "rm -f /etc/ssh/sshd_config.d/99-syamadmin.conf",
+                module="security", check=False,
+            )
+            msg = f"❌ SSH config test gagal (config dihapus agar SSH tetap aman):\n```\n{test['stderr'][:500]}\n```"
 
-        # Hasil dikembalikan ke pemanggil (bot) untuk ditampilkan — tidak duplikat via notifier
         return msg
 
     async def setup_fail2ban(self) -> str:
-        """Install and configure fail2ban."""
+        """Install and configure fail2ban with service verification."""
         await self.notifier.send("🛡 *Setting up Fail2Ban...*")
 
         r = await self.executor.run(
@@ -83,6 +152,26 @@ AllowTcpForwarding no
 
         if not r["success"]:
             return f"❌ Gagal install fail2ban: {r['stderr'][:300]}"
+
+        # Detect which nginx jails are safe to enable (nginx must be installed)
+        nginx_installed = await self.executor.run(
+            "which nginx", module="security", check=False,
+        )
+        nginx_jails = ""
+        if nginx_installed["success"]:
+            nginx_jails = """
+[nginx-http-auth]
+enabled = true
+port = http,https
+
+[nginx-botsearch]
+enabled = true
+port = http,https
+
+[nginx-limit-req]
+enabled = true
+port = http,https
+"""
 
         jail_config = f"""
 [DEFAULT]
@@ -97,37 +186,91 @@ enabled = true
 port = {self.ssh_port}
 maxretry = 3
 bantime = 7200
-
-[nginx-http-auth]
-enabled = true
-port = http,https
-
-[nginx-botsearch]
-enabled = true
-port = http,https
-
-[nginx-limit-req]
-enabled = true
-port = http,https
-"""
+{nginx_jails}"""
         escaped = jail_config.replace("'", "'\\''")
         await self.executor.run(
             f"echo '{escaped}' > /etc/fail2ban/jail.local",
             module="security",
         )
+
+        # Enable and start — then verify
         await self.executor.run(
             "systemctl enable --now fail2ban && systemctl restart fail2ban",
-            module="security",
+            module="security", check=False,
         )
 
-        msg = (
-            "✅ *Fail2Ban Active*\n"
-            "• SSH: 3 attempts → ban 2 hours\n"
-            "• Nginx auth: 3 attempts → ban 1 hour\n"
-            "• Bot search: enabled\n"
-            "• Rate limit: enabled"
+        # Verify service is actually running; attempt fix if not
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            check = await self.executor.run(
+                "systemctl is-active fail2ban", module="security", check=False,
+            )
+            if check["stdout"].strip() == "active":
+                break
+
+            journal = await self.executor.run(
+                "journalctl -u fail2ban -n 20 --no-pager 2>&1",
+                module="security", check=False,
+            )
+            stderr = journal.get("stdout", "").lower()
+            logger.warning(f"fail2ban not active (attempt {attempt}/{max_attempts}): {stderr[:300]}")
+
+            fixed = False
+            # Missing log file referenced by a jail
+            if "no file found" in stderr or "no such file" in stderr:
+                await self.executor.run(
+                    "touch /var/log/nginx/error.log /var/log/nginx/access.log 2>/dev/null || true",
+                    module="security", check=False,
+                )
+                fixed = True
+            # Backend mismatch (systemd not available in some containers)
+            if "no module named" in stderr or "failed to access socket" in stderr:
+                await self.executor.run(
+                    "sed -i 's/backend = systemd/backend = auto/' /etc/fail2ban/jail.local",
+                    module="security", check=False,
+                )
+                fixed = True
+            # Socket already in use from stale process
+            if "already in use" in stderr or "address already in use" in stderr:
+                await self.executor.run(
+                    "rm -f /var/run/fail2ban/fail2ban.sock 2>/dev/null || true",
+                    module="security", check=False,
+                )
+                fixed = True
+
+            if not fixed:
+                break
+            await self.notifier.send(
+                f"🔧 Auto-fix Fail2Ban diterapkan (percobaan {attempt}/{max_attempts}), restart ulang..."
+            )
+            await self.executor.run(
+                "systemctl restart fail2ban", module="security", check=False,
+            )
+
+        # Final status check
+        final = await self.executor.run(
+            "systemctl is-active fail2ban", module="security", check=False,
         )
-        # Hasil dikembalikan ke pemanggil (bot) untuk ditampilkan — tidak duplikat via notifier
+        if final["stdout"].strip() == "active":
+            nginx_note = (
+                "• Nginx auth: 3 attempts → ban 1 hour\n"
+                "• Bot search: enabled\n"
+                "• Rate limit: enabled"
+                if nginx_installed["success"]
+                else "• Nginx jails: dilewati (nginx belum terinstall)"
+            )
+            msg = (
+                "✅ *Fail2Ban Active*\n"
+                f"• SSH: 3 attempts → ban 2 hours\n"
+                f"{nginx_note}"
+            )
+        else:
+            msg = (
+                "⚠️ *Fail2Ban terinstall tapi gagal start.*\n"
+                "Cek log: `journalctl -u fail2ban -n 30`\n"
+                "SSH jail mungkin belum aktif — pertimbangkan hardening manual."
+            )
+
         return msg
 
     async def audit(self) -> str:

@@ -73,10 +73,10 @@ class Provisioner:
             "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx",
             module="provisioner", timeout=120,
         )
-        if r["success"]:
-            # Optimize Nginx config
-            await self._configure_nginx()
-        results.append(("Nginx", r["success"]))
+        nginx_ok = r["success"]
+        if nginx_ok:
+            nginx_ok = await self._configure_nginx()
+        results.append(("Nginx", nginx_ok))
 
         # Step 3: Install MySQL 8
         await self.notifier.send("🗄 [3/7] Installing MySQL 8...")
@@ -107,18 +107,40 @@ class Provisioner:
         r = await self._setup_swap()
         results.append(("Swap", r))
 
-        # Enable services
-        await self.executor.run("systemctl enable --now nginx", module="provisioner")
-        await self.executor.run("systemctl enable --now mysql", module="provisioner")
-        await self.executor.run(f"systemctl enable --now php{self.php_version}-fpm", module="provisioner")
+        # Enable services and verify they're actually running
+        svc_pairs = [
+            ("nginx", "nginx"),
+            ("mysql", "mysql"),
+            (f"php{self.php_version}-fpm", f"php{self.php_version}-fpm"),
+        ]
+        for svc_label, svc_unit in svc_pairs:
+            await self.executor.run(
+                f"systemctl enable --now {svc_unit}",
+                module="provisioner", check=False,
+            )
+            check = await self.executor.run(
+                f"systemctl is-active {svc_unit}",
+                module="provisioner", check=False,
+            )
+            if check["stdout"].strip() != "active":
+                await self.notifier.send(
+                    f"⚠️ `{svc_label}` tidak aktif setelah enable, mencoba restart..."
+                )
+                await self.executor.run(
+                    f"systemctl restart {svc_unit}",
+                    module="provisioner", check=False,
+                )
 
         # Report
         report = self._format_report(results, mysql_pass)
         await self.notifier.send(report)
         return report
 
-    async def _configure_nginx(self):
-        """Apply optimized Nginx configuration."""
+    async def _configure_nginx(self) -> bool:
+        """Apply optimized Nginx configuration with self-healing.
+
+        Returns True if nginx is left in a working state (optimized or default).
+        """
         nginx_conf = """
 # SyamAdmin Nginx Optimization
 worker_processes auto;
@@ -163,17 +185,121 @@ http {
 }
 """
         await self.executor.run(
-            f"cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak",
+            "cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak",
             module="provisioner",
         )
-        # Write config
         escaped = nginx_conf.replace("'", "'\\''")
         await self.executor.run(
             f"echo '{escaped}' > /etc/nginx/nginx.conf",
             module="provisioner",
         )
-        await self.executor.run("nginx -t", module="provisioner")
-        await self.executor.run("systemctl reload nginx", module="provisioner")
+
+        # Pre-emptive: strip IPv6 listen directives if kernel doesn't support it
+        ipv6_ok = await self._detect_ipv6_support()
+        if not ipv6_ok:
+            await self.notifier.send("ℹ️ IPv6 tidak tersedia — menyesuaikan konfigurasi Nginx...")
+            await self._strip_ipv6_from_configs()
+
+        # Test → diagnose → fix → retry loop
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            test = await self.executor.run(
+                "nginx -t 2>&1", module="provisioner", check=False,
+            )
+            if test["success"]:
+                await self.executor.run(
+                    "systemctl reload nginx 2>/dev/null || true",
+                    module="provisioner", check=False,
+                )
+                return True
+
+            stderr = (test.get("stderr", "") + " " + test.get("stdout", "")).strip()
+            logger.warning(f"nginx -t failed (attempt {attempt}/{max_attempts}): {stderr[:300]}")
+
+            if attempt < max_attempts:
+                fixed = await self._attempt_nginx_fix(stderr)
+                if not fixed:
+                    break
+                await self.notifier.send(
+                    f"🔧 Auto-fix diterapkan (percobaan {attempt}/{max_attempts}), menguji ulang..."
+                )
+
+        # All fix attempts failed — restore backup and try that
+        logger.error("Nginx config optimization failed, restoring backup")
+        await self.notifier.send("⚠️ Optimasi gagal, mengembalikan konfigurasi default Nginx...")
+        await self.executor.run(
+            "cp /etc/nginx/nginx.conf.bak /etc/nginx/nginx.conf",
+            module="provisioner",
+        )
+        if not ipv6_ok:
+            await self._strip_ipv6_from_configs()
+
+        test = await self.executor.run("nginx -t 2>&1", module="provisioner", check=False)
+        if test["success"]:
+            await self.executor.run(
+                "systemctl reload nginx 2>/dev/null || true",
+                module="provisioner", check=False,
+            )
+            return True
+
+        logger.error("Nginx cannot start even with default config")
+        return False
+
+    async def _strip_ipv6_from_configs(self):
+        """Remove listen [::] directives from all nginx config files."""
+        for path in (
+            "/etc/nginx/sites-available/*",
+            "/etc/nginx/sites-enabled/*",
+            "/etc/nginx/conf.d/*.conf",
+        ):
+            await self.executor.run(
+                f"sed -i '/listen \\[::]/d' {path} 2>/dev/null || true",
+                module="provisioner", check=False,
+            )
+        logger.info("Stripped IPv6 listen directives from nginx configs")
+
+    async def _attempt_nginx_fix(self, stderr: str) -> bool:
+        """Pattern-match a known nginx error and apply a targeted fix.
+
+        Returns True if a fix was applied (caller should re-test).
+        """
+        s = stderr.lower()
+
+        # IPv6 socket error
+        if "address family not supported" in s or "[::]:80" in s or "[::]:443" in s:
+            logger.info("Auto-fix: stripping IPv6 listen directives")
+            await self._strip_ipv6_from_configs()
+            return True
+
+        # Duplicate default_server (two sites both claim default)
+        if "duplicate default server" in s:
+            logger.info("Auto-fix: removing default site to fix duplicate default_server")
+            await self.executor.run(
+                "rm -f /etc/nginx/sites-enabled/default",
+                module="provisioner", check=False,
+            )
+            return True
+
+        # Missing include path
+        if "no such file" in s or "is not a directory" in s:
+            logger.info("Auto-fix: creating missing nginx directories")
+            await self.executor.run(
+                "mkdir -p /etc/nginx/conf.d /etc/nginx/sites-enabled /etc/nginx/sites-available",
+                module="provisioner", check=False,
+            )
+            return True
+
+        # Port 80 already in use (e.g. apache2 left running)
+        if "already in use" in s:
+            logger.info("Auto-fix: stopping apache2 which may hold port 80")
+            await self.executor.run(
+                "systemctl stop apache2 2>/dev/null; "
+                "systemctl disable apache2 2>/dev/null || true",
+                module="provisioner", check=False,
+            )
+            return True
+
+        return False
 
     async def _install_mysql(self, password: str) -> bool:
         """Install and secure MySQL 8."""

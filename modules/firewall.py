@@ -17,8 +17,22 @@ class FirewallManager:
         self.ssh_port = int(os.environ.get("SSH_PORT", 22))
 
     async def setup_defaults(self) -> str:
-        """Initialize UFW with sensible defaults for LEMP stack."""
+        """Initialize UFW with sensible defaults for LEMP stack.
+
+        Auto-installs ufw if not present. Verifies firewall is active after setup.
+        """
         await self.notifier.send("🧱 *Setting up firewall defaults...*")
+
+        # Pre-check: ufw installed?
+        check = await self.executor.run("which ufw", module="firewall", check=False)
+        if not check["success"]:
+            await self.notifier.send("ℹ️ UFW belum terinstall, menginstall...")
+            inst = await self.executor.run(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw",
+                module="firewall", timeout=120, check=False,
+            )
+            if not inst["success"]:
+                return f"❌ Gagal menginstall UFW: {inst['stderr'][:300]}"
 
         commands = [
             "ufw --force reset",
@@ -31,9 +45,23 @@ class FirewallManager:
         ]
 
         for cmd in commands:
-            r = await self.executor.run(cmd, module="firewall")
+            r = await self.executor.run(cmd, module="firewall", check=False)
             if not r["success"]:
+                # If enable fails, try reloading instead
+                if "enable" in cmd:
+                    logger.warning(f"ufw enable failed, trying reload: {r['stderr'][:200]}")
+                    r2 = await self.executor.run(
+                        "ufw --force enable 2>&1 || ufw reload 2>&1",
+                        module="firewall", check=False,
+                    )
+                    if r2["success"]:
+                        continue
                 return f"❌ Firewall setup gagal pada: `{cmd}`\n{r['stderr'][:300]}"
+
+        # Verify firewall is active
+        verify = await self.executor.run("ufw status", module="firewall", check=False)
+        if "active" not in verify.get("stdout", "").lower():
+            return "⚠️ UFW rules diterapkan tapi firewall belum aktif. Cek `ufw status` secara manual."
 
         return await self.status()
 
