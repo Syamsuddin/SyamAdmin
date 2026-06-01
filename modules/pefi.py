@@ -5,19 +5,38 @@ Mengumpulkan data traffic jaringan, mendeteksi anomali secara proaktif,
 dan memblokir ancaman sebelum serangan berhasil — berbasis analisis AI.
 
 Sprint 1: Collector + Aggregation + DB + Management API stubs.
+Sprint 2: Baseline Engine + Anomaly Detector (6 rule-based checks).
 """
 
 import asyncio
 import ipaddress
 import json
 import logging
+import math
 import re
 import sqlite3
 from collections import defaultdict
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 logger = logging.getLogger("syamadmin.pefi")
+
+# Alpha untuk Exponential Moving Average baseline — makin kecil makin stabil
+_EMA_ALPHA = 0.15
+
+# Minimum sigma (standar deviasi) untuk hindari false positive saat traffic sangat tenang
+_MIN_STDDEV = 2.0
+
+
+@dataclass
+class ThreatEvent:
+    """Satu kejadian anomali yang terdeteksi pada satu IP."""
+    ip: str
+    threat_type: str    # PORT_SCAN | SYN_FLOOD | BRUTE_FORCE | CONN_SPIKE | TRAFFIC_SPIKE | RECON | RECIDIVIST
+    severity: str       # LOW | MEDIUM | HIGH | CRITICAL
+    details: dict = field(default_factory=dict)
+    detected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class PreEmptiveFirewall:
@@ -44,6 +63,16 @@ class PreEmptiveFirewall:
         self._trusted_nets = self._build_trusted_nets()
         self.interval = int(self.config.get("PEFI_INTERVAL", 60))
         self.enabled = self.config.get("PEFI_ENABLED", "true").lower() == "true"
+
+        # Threshold anomali — semua overridable via config.env
+        self._thr_conn       = int(self.config.get("PEFI_THRESHOLD_CONN_PER_MIN", 200))
+        self._thr_port_scan  = int(self.config.get("PEFI_THRESHOLD_PORT_SCAN", 10))
+        self._thr_syn        = int(self.config.get("PEFI_THRESHOLD_SYN", 50))
+        self._thr_spike_mult = float(self.config.get("PEFI_THRESHOLD_SPIKE_MULTIPLIER", 3.0))
+        self._thr_ssh_fail   = int(self.config.get("PEFI_THRESHOLD_SSH_FAIL", 20))
+        self._thr_http_err   = int(self.config.get("PEFI_THRESHOLD_HTTP_ERRORS", 50))
+        self._baseline_min   = int(self.config.get("PEFI_BASELINE_MIN_SAMPLES", 10))
+
         self._ensure_db()
         self._load_whitelist_cache()
 
@@ -98,6 +127,7 @@ class PreEmptiveFirewall:
                     port INTEGER NOT NULL,
                     hour_of_day INTEGER NOT NULL,
                     avg_conn_per_min REAL DEFAULT 0,
+                    m2_conn REAL DEFAULT 0,
                     stddev_conn REAL DEFAULT 0,
                     avg_unique_ips INTEGER DEFAULT 0,
                     sample_count INTEGER DEFAULT 0,
@@ -143,6 +173,11 @@ class PreEmptiveFirewall:
                 );
             """)
             conn.commit()
+            # Sprint 2 migration: tambah m2_conn ke baseline jika belum ada
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(pefi_baseline)").fetchall()}
+            if "m2_conn" not in cols:
+                conn.execute("ALTER TABLE pefi_baseline ADD COLUMN m2_conn REAL DEFAULT 0")
+                conn.commit()
             conn.close()
             logger.info("PeFi: tabel DB siap.")
         except Exception as e:
@@ -390,11 +425,320 @@ class PreEmptiveFirewall:
             logger.warning(f"PeFi prune error: {e}")
 
     # ------------------------------------------------------------------
+    # LAYER 3: BASELINE ENGINE
+    # ------------------------------------------------------------------
+
+    def _update_baseline(self, aggregated: list[dict]):
+        """
+        Perbarui baseline traffic normal per-port per-jam menggunakan
+        algoritma Welford's online (incremental mean + variance tanpa
+        menyimpan seluruh history).
+
+        Dipanggil setiap tick SEBELUM anomaly detection agar baseline
+        tidak tercemar oleh kejadian yang sedang terjadi saat ini.
+        """
+        if not aggregated:
+            return
+
+        hour = datetime.now(timezone.utc).hour
+        # Hitung total koneksi per-port dari semua IP di interval ini
+        port_conn: defaultdict[int, int] = defaultdict(int)
+        port_ips: defaultdict[int, set] = defaultdict(set)
+
+        for s in aggregated:
+            for port in s.get("ports_targeted", []):
+                port_conn[port] += s["conn_count"]
+                port_ips[port].add(s["ip"])
+
+        if not port_conn:
+            return
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            for port, total_conn in port_conn.items():
+                row = conn.execute(
+                    "SELECT avg_conn_per_min, m2_conn, stddev_conn, avg_unique_ips, sample_count "
+                    "FROM pefi_baseline WHERE port=? AND hour_of_day=?",
+                    (port, hour),
+                ).fetchone()
+
+                if row is None:
+                    # Sampel pertama untuk port+jam ini
+                    conn.execute(
+                        """INSERT INTO pefi_baseline
+                           (port, hour_of_day, avg_conn_per_min, m2_conn, stddev_conn,
+                            avg_unique_ips, sample_count)
+                           VALUES (?,?,?,0,0,?,1)""",
+                        (port, hour, float(total_conn), len(port_ips[port])),
+                    )
+                else:
+                    old_avg, old_m2, _, old_unique, n = row
+                    n_new = n + 1
+                    # Welford's online algorithm
+                    delta = total_conn - old_avg
+                    new_avg = old_avg + delta / n_new
+                    delta2 = total_conn - new_avg
+                    new_m2 = old_m2 + delta * delta2
+                    new_stddev = math.sqrt(new_m2 / n_new) if n_new >= 2 else 0.0
+                    # EMA untuk unique IPs (tidak perlu presisi tinggi)
+                    new_unique = int((1 - _EMA_ALPHA) * old_unique + _EMA_ALPHA * len(port_ips[port]))
+                    conn.execute(
+                        """UPDATE pefi_baseline
+                           SET avg_conn_per_min=?, m2_conn=?, stddev_conn=?,
+                               avg_unique_ips=?, sample_count=?, updated_at=CURRENT_TIMESTAMP
+                           WHERE port=? AND hour_of_day=?""",
+                        (new_avg, new_m2, new_stddev, new_unique, n_new, port, hour),
+                    )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"PeFi baseline update error: {e}")
+
+    def _load_baseline(self) -> dict[tuple, dict]:
+        """Muat baseline dari DB untuk jam saat ini → dipakai anomaly detector."""
+        hour = datetime.now(timezone.utc).hour
+        result: dict[tuple, dict] = {}
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                "SELECT port, avg_conn_per_min, stddev_conn, sample_count "
+                "FROM pefi_baseline WHERE hour_of_day=?",
+                (hour,),
+            ).fetchall()
+            conn.close()
+            for port, avg, stddev, n in rows:
+                result[(port, hour)] = {
+                    "avg": avg,
+                    "stddev": max(stddev, _MIN_STDDEV),
+                    "sample_count": n,
+                }
+        except Exception as e:
+            logger.warning(f"PeFi load baseline error: {e}")
+        return result
+
+    # ------------------------------------------------------------------
+    # LAYER 4: ANOMALY DETECTOR (rule-based, tanpa AI)
+    # ------------------------------------------------------------------
+
+    def _detect_anomalies(
+        self, aggregated: list[dict], baseline: dict
+    ) -> list[ThreatEvent]:
+        """
+        Jalankan 6 + 1 rule-based checks terhadap data aggregated.
+        Return list ThreatEvent — kosong jika tidak ada anomali.
+
+        Checks:
+          1. PORT_SCAN    — terlalu banyak port unik dari satu IP
+          2. SYN_FLOOD    — terlalu banyak half-open SYN dari satu IP
+          3. BRUTE_FORCE  — terlalu banyak SSH login failure dari satu IP
+          4. CONN_SPIKE   — koneksi per-interval dari satu IP melampaui threshold absolut
+          5. TRAFFIC_SPIKE— koneksi ke port tertentu jauh di atas baseline historis
+          6. RECON        — terlalu banyak HTTP 4xx error (penjelajahan celah)
+          7. RECIDIVIST   — IP yang pernah diblokir PeFi muncul lagi
+        """
+        threats: list[ThreatEvent] = []
+        hour = datetime.now(timezone.utc).hour
+
+        # Per-port aggregate untuk TRAFFIC_SPIKE check
+        port_total: defaultdict[int, int] = defaultdict(int)
+        for s in aggregated:
+            for port in s.get("ports_targeted", []):
+                port_total[port] += s["conn_count"]
+
+        recidivists = self._get_recidivist_ips()
+
+        for s in aggregated:
+            ip = s["ip"]
+
+            # 1. PORT_SCAN
+            if s["port_count"] >= self._thr_port_scan:
+                severity = "CRITICAL" if s["port_count"] >= self._thr_port_scan * 3 else "HIGH"
+                threats.append(ThreatEvent(
+                    ip=ip, threat_type="PORT_SCAN", severity=severity,
+                    details={
+                        "port_count": s["port_count"],
+                        "ports_sample": s["ports_targeted"][:10],
+                        "threshold": self._thr_port_scan,
+                    },
+                ))
+
+            # 2. SYN_FLOOD
+            if s["conn_syn"] >= self._thr_syn:
+                severity = "CRITICAL" if s["conn_syn"] >= self._thr_syn * 2 else "HIGH"
+                threats.append(ThreatEvent(
+                    ip=ip, threat_type="SYN_FLOOD", severity=severity,
+                    details={
+                        "syn_count": s["conn_syn"],
+                        "threshold": self._thr_syn,
+                    },
+                ))
+
+            # 3. BRUTE_FORCE (SSH)
+            if s["ssh_fail_count"] >= self._thr_ssh_fail:
+                severity = "HIGH" if s["ssh_fail_count"] >= self._thr_ssh_fail * 2 else "MEDIUM"
+                threats.append(ThreatEvent(
+                    ip=ip, threat_type="BRUTE_FORCE", severity=severity,
+                    details={
+                        "ssh_fail_count": s["ssh_fail_count"],
+                        "threshold": self._thr_ssh_fail,
+                    },
+                ))
+
+            # 4. CONN_SPIKE (absolute)
+            if s["conn_count"] >= self._thr_conn:
+                severity = "HIGH" if s["conn_count"] >= self._thr_conn * 2 else "MEDIUM"
+                threats.append(ThreatEvent(
+                    ip=ip, threat_type="CONN_SPIKE", severity=severity,
+                    details={
+                        "conn_count": s["conn_count"],
+                        "threshold": self._thr_conn,
+                    },
+                ))
+
+            # 6. RECON (HTTP error flood)
+            if s["http_error_count"] >= self._thr_http_err:
+                severity = "HIGH" if s["http_error_count"] >= self._thr_http_err * 3 else "MEDIUM"
+                threats.append(ThreatEvent(
+                    ip=ip, threat_type="RECON", severity=severity,
+                    details={
+                        "http_error_count": s["http_error_count"],
+                        "http_req_count": s["http_req_count"],
+                        "threshold": self._thr_http_err,
+                    },
+                ))
+
+            # 7. RECIDIVIST
+            if ip in recidivists and s["conn_count"] > 0:
+                threats.append(ThreatEvent(
+                    ip=ip, threat_type="RECIDIVIST", severity="HIGH",
+                    details={
+                        "previous_blocks": recidivists[ip],
+                        "current_conn": s["conn_count"],
+                    },
+                ))
+
+        # 5. TRAFFIC_SPIKE (per-port, baseline comparison)
+        for port, total in port_total.items():
+            key = (port, hour)
+            bl = baseline.get(key)
+            if not bl or bl["sample_count"] < self._baseline_min:
+                continue  # Baseline belum cukup sampel
+            threshold_val = bl["avg"] + self._thr_spike_mult * bl["stddev"]
+            if total > threshold_val and total > bl["avg"] * self._thr_spike_mult:
+                # Cari IP penyumbang terbesar sebagai representasi
+                top_ip = max(
+                    (s for s in aggregated if port in s.get("ports_targeted", [])),
+                    key=lambda x: x["conn_count"],
+                    default=None,
+                )
+                if top_ip:
+                    threats.append(ThreatEvent(
+                        ip=top_ip["ip"],
+                        threat_type="TRAFFIC_SPIKE",
+                        severity="MEDIUM",
+                        details={
+                            "port": port,
+                            "total_conn": total,
+                            "baseline_avg": round(bl["avg"], 1),
+                            "baseline_stddev": round(bl["stddev"], 1),
+                            "threshold": round(threshold_val, 1),
+                            "multiplier": round(total / max(bl["avg"], 1), 1),
+                        },
+                    ))
+
+        return threats
+
+    def _get_recidivist_ips(self) -> dict[str, int]:
+        """Return dict {ip: jumlah_block_sebelumnya} untuk IP yang pernah diblokir PeFi."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                """SELECT ip, COUNT(*) as cnt FROM pefi_rules
+                   WHERE rule_type='block' GROUP BY ip HAVING cnt > 0"""
+            ).fetchall()
+            conn.close()
+            return {r[0]: r[1] for r in rows}
+        except Exception:
+            return {}
+
+    def _save_threats(self, threats: list[ThreatEvent]):
+        """
+        Simpan ThreatEvent ke DB dengan deduplication:
+        IP + threat_type yang sama dalam 60 menit terakhir diabaikan
+        (kecuali severity meningkat).
+        """
+        if not threats:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            saved = 0
+            for t in threats:
+                # Cek duplikat dalam 60 menit
+                existing = conn.execute(
+                    """SELECT id, severity FROM pefi_threats
+                       WHERE ip=? AND threat_type=?
+                         AND detected_at > datetime('now', '-60 minutes')
+                         AND action_taken != 'resolved'
+                       ORDER BY detected_at DESC LIMIT 1""",
+                    (t.ip, t.threat_type),
+                ).fetchone()
+
+                severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+                if existing:
+                    old_rank = severity_rank.get(existing[1], 0)
+                    new_rank = severity_rank.get(t.severity, 0)
+                    if new_rank <= old_rank:
+                        continue  # Sudah dilaporkan, severity tidak meningkat
+
+                conn.execute(
+                    """INSERT INTO pefi_threats
+                       (ip, threat_type, severity, action_taken, details)
+                       VALUES (?,?,?,'pending',?)""",
+                    (t.ip, t.threat_type, t.severity, json.dumps(t.details)),
+                )
+                saved += 1
+
+            conn.commit()
+            conn.close()
+            if saved:
+                logger.info(f"PeFi: {saved} ancaman baru disimpan ke DB.")
+        except Exception as e:
+            logger.warning(f"PeFi save threats error: {e}")
+
+    def _get_pending_threats(self) -> list[dict]:
+        """Ambil ancaman dengan status 'pending' untuk diproses (Sprint 3: AI analysis)."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                """SELECT id, ip, threat_type, severity, details
+                   FROM pefi_threats
+                   WHERE action_taken='pending'
+                     AND detected_at > datetime('now', '-30 minutes')
+                   ORDER BY
+                     CASE severity
+                       WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
+                       WHEN 'MEDIUM' THEN 3 ELSE 4 END,
+                     detected_at DESC
+                   LIMIT 20""",
+            ).fetchall()
+            conn.close()
+            return [
+                {
+                    "id": r[0], "ip": r[1], "threat_type": r[2],
+                    "severity": r[3], "details": json.loads(r[4] or "{}"),
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"PeFi get pending threats error: {e}")
+            return []
+
+    # ------------------------------------------------------------------
     # MAIN LOOP
     # ------------------------------------------------------------------
 
     async def _tick(self):
-        """Satu siklus: collect → aggregate → store. Anomali detection di Sprint 2."""
+        """Satu siklus: collect → aggregate → baseline → detect → save → notify."""
         logger.debug("PeFi tick: mengumpulkan data traffic...")
 
         results = await asyncio.gather(
@@ -408,23 +752,70 @@ class PreEmptiveFirewall:
         conn_stats  = results[0] if isinstance(results[0], list) else []
         auth_stats  = results[1] if isinstance(results[1], list) else []
         nginx_stats = results[2] if isinstance(results[2], list) else []
-        # results[3] = kernel_stats dict, dipakai Sprint 2
 
-        for i, r in enumerate(results[:3]):
-            if isinstance(r, Exception):
-                logger.warning(f"PeFi collector[{i}] error: {r}")
+        for i, label in enumerate(["connections", "auth", "nginx"]):
+            if isinstance(results[i], Exception):
+                logger.warning(f"PeFi collector[{label}] error: {results[i]}")
 
         aggregated = await self._aggregate(conn_stats, auth_stats, nginx_stats)
         self._store_ip_stats(aggregated)
+
+        # Sprint 2: Baseline update SEBELUM detect (agar data saat ini
+        # tidak langsung mempengaruhi threshold yang akan memeriksa dirinya sendiri)
+        baseline = self._load_baseline()
+        self._update_baseline(aggregated)
+
+        # Deteksi anomali
+        threats = self._detect_anomalies(aggregated, baseline)
+        self._save_threats(threats)
+
+        # Notifikasi ke Telegram untuk ancaman HIGH/CRITICAL (Sprint 4: + AI analysis)
+        critical = [t for t in threats if t.severity in ("HIGH", "CRITICAL")]
+        if critical:
+            await self._notify_threats(critical)
+
         self._prune_old_data()
 
-        if aggregated:
-            logger.info(
-                f"PeFi tick selesai: {len(aggregated)} IP dipantau "
-                f"(conn={sum(s['conn_count'] for s in aggregated)}, "
-                f"ssh_fail={sum(s['ssh_fail_count'] for s in aggregated)}, "
-                f"http_err={sum(s['http_error_count'] for s in aggregated)})"
+        logger.info(
+            f"PeFi tick: {len(aggregated)} IP, "
+            f"{len(threats)} ancaman baru "
+            f"({len(critical)} HIGH/CRITICAL)"
+        )
+
+    async def _notify_threats(self, threats: list[ThreatEvent]):
+        """Kirim ringkasan ancaman HIGH/CRITICAL ke Telegram admin."""
+        if not threats:
+            return
+        icons = {"CRITICAL": "💀", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵"}
+        lines = ["🛡️ *PeFi — Ancaman Terdeteksi*\n"]
+        for t in threats[:5]:  # maks 5 per notifikasi agar tidak spam
+            icon = icons.get(t.severity, "⚪")
+            detail_str = ""
+            if t.threat_type == "PORT_SCAN":
+                detail_str = f"scan {t.details.get('port_count')} port"
+            elif t.threat_type == "SYN_FLOOD":
+                detail_str = f"{t.details.get('syn_count')} SYN half-open"
+            elif t.threat_type == "BRUTE_FORCE":
+                detail_str = f"{t.details.get('ssh_fail_count')} SSH failures"
+            elif t.threat_type == "CONN_SPIKE":
+                detail_str = f"{t.details.get('conn_count')} koneksi (threshold: {t.details.get('threshold')})"
+            elif t.threat_type == "TRAFFIC_SPIKE":
+                detail_str = f"port {t.details.get('port')}: {t.details.get('multiplier')}x di atas baseline"
+            elif t.threat_type == "RECON":
+                detail_str = f"{t.details.get('http_error_count')} HTTP errors"
+            elif t.threat_type == "RECIDIVIST":
+                detail_str = f"pernah diblokir {t.details.get('previous_blocks')}x"
+            lines.append(
+                f"{icon} `{t.ip}` — *{t.threat_type}* [{t.severity}]\n"
+                f"   {detail_str}"
             )
+        if len(threats) > 5:
+            lines.append(f"\n_...dan {len(threats) - 5} ancaman lainnya._")
+        lines.append("\n_Ketik `/pefi threats` untuk detail lengkap._")
+        try:
+            await self.notifier.send("\n".join(lines))
+        except Exception as e:
+            logger.warning(f"PeFi notify error: {e}")
 
     async def run_loop(self):
         """Background async task — parallel dengan bot & monitor."""
