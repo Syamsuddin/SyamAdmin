@@ -111,6 +111,18 @@ HELP_TEXT = """
 `/token` — Statistik & biaya token AI
 `/model` — Lihat & ganti model AI (haiku/sonnet/opus)
 
+*🛡️ PeFi — Pre-Emptive Firewall:*
+`/pefi` — Status PeFi & statistik ancaman
+`/pefi threats` — Ancaman aktif yang dipantau AI
+`/pefi rules` — Daftar IP yang diblokir PeFi
+`/pefi report [jam]` — Laporan aktivitas (default 24 jam)
+`/pefi scan` — Trigger analisis manual sekarang (OTP)
+`/pefi block <ip> [jam]` — Blokir IP manual (OTP)
+`/pefi unblock <ip>` — Hapus blokir IP (OTP)
+`/pefi whitelist <ip>` — Whitelist IP permanen (OTP)
+`/pefi ignore <id>` — Tandai ancaman sebagai false positive (OTP)
+`/pefi autoblock on|off` — Toggle auto-block tanpa OTP (OTP)
+
 *Lainnya:*
 `/confirm <OTP>` — Konfirmasi aksi berisiko
 `/help` — Bantuan ini
@@ -1185,6 +1197,181 @@ class SyamAdminBot:
         else:
             await self._reply(update, "❌ Gagal mengganti model.", parse_mode="Markdown")
 
+    async def cmd_pefi(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """PeFi — Pre-Emptive Firewall Agent command router."""
+        if not await self._guard(update):
+            return
+
+        pefi = self.modules.get("pefi")
+        if not pefi:
+            await self._reply(update, "❌ Modul PeFi tidak aktif.", parse_mode="Markdown")
+            return
+
+        args = context.args or []
+        sub = args[0].lower() if args else ""
+
+        # ── Perintah informasi (tanpa OTP) ──────────────────────────────
+        if sub == "" or sub == "status":
+            msg = await self._reply(update, "🛡️ Mengambil status PeFi...")
+            result = await pefi.get_status()
+            await self._edit(msg, result, parse_mode="Markdown")
+
+        elif sub == "threats":
+            msg = await self._reply(update, "⏳ Memuat daftar ancaman...")
+            result = await pefi.get_active_threats()
+            await self._edit(msg, result, parse_mode="Markdown")
+
+        elif sub == "rules":
+            msg = await self._reply(update, "⏳ Memuat aturan aktif...")
+            result = await pefi.get_active_rules()
+            await self._edit(msg, result, parse_mode="Markdown")
+
+        elif sub == "report":
+            hours = int(args[1]) if len(args) > 1 and args[1].isdigit() else 24
+            msg = await self._reply(update, f"📊 Menyusun laporan {hours} jam terakhir...")
+            result = await pefi.get_report(hours=hours)
+            await self._edit(msg, result, parse_mode="Markdown")
+
+        # ── Perintah destructive/perubahan (wajib OTP) ──────────────────
+        elif sub == "scan":
+            otp = self._generate_otp()
+            await self._reply(
+                update,
+                f"🛡️ *Konfirmasi PeFi Scan Manual*\n\n"
+                f"Akan memicu satu siklus analisis traffic sekarang.\n\n"
+                f"Balas dengan `{otp}` untuk melanjutkan (60 detik).",
+                parse_mode="Markdown",
+            )
+            self._pending_confirmations[self.admin_id] = {
+                "action": "pefi_scan",
+                "otp": otp,
+                "expires": datetime.now().timestamp() + 60,
+            }
+
+        elif sub == "block":
+            if len(args) < 2:
+                await self._reply(update, "❌ Format: `/pefi block <ip> [jam]`", parse_mode="Markdown")
+                return
+            ip = args[1]
+            hours = int(args[2]) if len(args) > 2 and args[2].isdigit() else 24
+            otp = self._generate_otp()
+            await self._reply(
+                update,
+                f"🔒 *Konfirmasi Blokir IP*\n\n"
+                f"• IP: `{ip}`\n"
+                f"• Durasi: {hours} jam\n\n"
+                f"Balas dengan `{otp}` untuk memblokir (60 detik).",
+                parse_mode="Markdown",
+            )
+            self._pending_confirmations[self.admin_id] = {
+                "action": "pefi_block",
+                "ip": ip,
+                "hours": hours,
+                "otp": otp,
+                "expires": datetime.now().timestamp() + 60,
+            }
+
+        elif sub == "unblock":
+            if len(args) < 2:
+                await self._reply(update, "❌ Format: `/pefi unblock <ip>`", parse_mode="Markdown")
+                return
+            ip = args[1]
+            otp = self._generate_otp()
+            await self._reply(
+                update,
+                f"🔓 *Konfirmasi Hapus Blokir*\n\n"
+                f"• IP: `{ip}`\n\n"
+                f"Balas dengan `{otp}` untuk melanjutkan (60 detik).",
+                parse_mode="Markdown",
+            )
+            self._pending_confirmations[self.admin_id] = {
+                "action": "pefi_unblock",
+                "ip": ip,
+                "otp": otp,
+                "expires": datetime.now().timestamp() + 60,
+            }
+
+        elif sub == "whitelist":
+            if len(args) < 2:
+                await self._reply(update, "❌ Format: `/pefi whitelist <ip>`", parse_mode="Markdown")
+                return
+            ip = args[1]
+            reason = " ".join(args[2:]) if len(args) > 2 else "Ditambahkan manual oleh admin"
+            otp = self._generate_otp()
+            await self._reply(
+                update,
+                f"✅ *Konfirmasi Whitelist IP*\n\n"
+                f"• IP: `{ip}`\n"
+                f"• Alasan: {reason}\n\n"
+                f"PeFi tidak akan memproses IP ini. Balas `{otp}` untuk konfirmasi (60 detik).",
+                parse_mode="Markdown",
+            )
+            self._pending_confirmations[self.admin_id] = {
+                "action": "pefi_whitelist",
+                "ip": ip,
+                "reason": reason,
+                "otp": otp,
+                "expires": datetime.now().timestamp() + 60,
+            }
+
+        elif sub == "ignore":
+            if len(args) < 2 or not args[1].isdigit():
+                await self._reply(update, "❌ Format: `/pefi ignore <threat_id>`", parse_mode="Markdown")
+                return
+            threat_id = int(args[1])
+            otp = self._generate_otp()
+            await self._reply(
+                update,
+                f"⬜ *Tandai Ancaman sebagai False Positive*\n\n"
+                f"• Threat ID: `{threat_id}`\n\n"
+                f"Balas `{otp}` untuk konfirmasi (60 detik).",
+                parse_mode="Markdown",
+            )
+            self._pending_confirmations[self.admin_id] = {
+                "action": "pefi_ignore",
+                "threat_id": threat_id,
+                "otp": otp,
+                "expires": datetime.now().timestamp() + 60,
+            }
+
+        elif sub == "autoblock":
+            if len(args) < 2 or args[1].lower() not in ("on", "off"):
+                current = pefi.config.get("PEFI_AUTO_BLOCK", "false").lower()
+                status = "🟢 ON" if current == "true" else "🔴 OFF"
+                await self._reply(
+                    update,
+                    f"🤖 *PeFi Auto-Block*\n\nStatus saat ini: {status}\n\n"
+                    f"Gunakan `/pefi autoblock on` atau `/pefi autoblock off`.",
+                    parse_mode="Markdown",
+                )
+                return
+            toggle = args[1].lower()
+            otp = self._generate_otp()
+            action_str = "MENGAKTIFKAN" if toggle == "on" else "MENONAKTIFKAN"
+            await self._reply(
+                update,
+                f"⚠️ *Konfirmasi {action_str} Auto-Block*\n\n"
+                f"{'Auto-block ON: ancaman HIGH/CRITICAL dengan confidence ≥ 95% diblokir TANPA konfirmasi admin.' if toggle == 'on' else 'Auto-block OFF: semua blokir butuh konfirmasi manual admin.'}\n\n"
+                f"Balas `{otp}` untuk melanjutkan (60 detik).",
+                parse_mode="Markdown",
+            )
+            self._pending_confirmations[self.admin_id] = {
+                "action": "pefi_autoblock",
+                "toggle": toggle,
+                "otp": otp,
+                "expires": datetime.now().timestamp() + 60,
+            }
+
+        else:
+            await self._reply(
+                update,
+                "❓ Sub-command tidak dikenal.\n\n"
+                "Tersedia: `status` · `threats` · `rules` · `report` · `scan` · "
+                "`block` · `unblock` · `whitelist` · `ignore` · `autoblock`\n\n"
+                "Contoh: `/pefi threats` atau `/pefi block 1.2.3.4`",
+                parse_mode="Markdown",
+            )
+
     async def cmd_cron(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Natural language scheduling via AI."""
         if not await self._guard(update):
@@ -1518,6 +1705,54 @@ class SyamAdminBot:
             result = await self.modules["security"].change_ssh_port(new_port)
             await self._reply(update,result, parse_mode="Markdown")
 
+        # ── PeFi actions ─────────────────────────────────────────────────
+        elif action == "pefi_scan":
+            pefi = self.modules.get("pefi")
+            await self._reply(update, "🛡️ Menjalankan PeFi scan manual...")
+            result = await pefi.scan_now()
+            await self._reply(update, result, parse_mode="Markdown")
+
+        elif action == "pefi_block":
+            pefi = self.modules.get("pefi")
+            ip = pending["ip"]
+            hours = pending.get("hours", 24)
+            await self._reply(update, f"🔒 Memblokir `{ip}`...", parse_mode="Markdown")
+            result = await pefi.approve_block(ip, duration_hours=hours)
+            await self._reply(update, result, parse_mode="Markdown")
+
+        elif action == "pefi_unblock":
+            pefi = self.modules.get("pefi")
+            ip = pending["ip"]
+            await self._reply(update, f"🔓 Menghapus blokir `{ip}`...", parse_mode="Markdown")
+            result = await pefi.remove_rule(ip)
+            await self._reply(update, result, parse_mode="Markdown")
+
+        elif action == "pefi_whitelist":
+            pefi = self.modules.get("pefi")
+            ip = pending["ip"]
+            reason = pending.get("reason", "Manual oleh admin")
+            result = await pefi.whitelist_ip(ip, reason=reason)
+            await self._reply(update, result, parse_mode="Markdown")
+
+        elif action == "pefi_ignore":
+            pefi = self.modules.get("pefi")
+            threat_id = pending["threat_id"]
+            result = await pefi.ignore_threat(threat_id)
+            await self._reply(update, result, parse_mode="Markdown")
+
+        elif action == "pefi_autoblock":
+            pefi = self.modules.get("pefi")
+            toggle = pending["toggle"]
+            pefi.config["PEFI_AUTO_BLOCK"] = "true" if toggle == "on" else "false"
+            status = "🟢 AKTIF" if toggle == "on" else "🔴 NONAKTIF"
+            await self._reply(
+                update,
+                f"✅ *Auto-Block PeFi: {status}*\n\n"
+                f"{'IP dengan threat HIGH/CRITICAL dan confidence ≥95% akan diblokir otomatis.' if toggle == 'on' else 'Semua blokir kini butuh konfirmasi manual admin.'}\n\n"
+                f"_Pengaturan aktif langsung, tidak perlu restart._",
+                parse_mode="Markdown",
+            )
+
     async def run(self):
         """Start the Telegram bot."""
         logger.info("Starting Telegram bot...")
@@ -1549,6 +1784,7 @@ class SyamAdminBot:
         app.add_handler(CommandHandler("harden_ssh_port", self.cmd_harden_ssh_port))
         app.add_handler(CommandHandler("restore", self.cmd_restore))
         app.add_handler(CommandHandler("setup", self.cmd_setup))
+        app.add_handler(CommandHandler("pefi", self.cmd_pefi))
 
         # Free-text handler (last)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
@@ -1571,6 +1807,7 @@ class SyamAdminBot:
             BotCommand("optimize", "AI Resource Optimizer"),
             BotCommand("restore", "Restore dari backup"),
             BotCommand("setup", "Panduan setup pemula"),
+            BotCommand("pefi", "Pre-Emptive Firewall AI"),
             BotCommand("help", "Bantuan"),
         ])
 

@@ -739,6 +739,8 @@ class PreEmptiveFirewall:
 
     async def _tick(self):
         """Satu siklus: collect → aggregate → baseline → detect → save → notify."""
+        if not self.enabled:
+            return  # sementara dinonaktifkan via /pefi autoblock atau toggle
         logger.debug("PeFi tick: mengumpulkan data traffic...")
 
         results = await asyncio.gather(
