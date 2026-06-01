@@ -65,8 +65,24 @@ async def main():
     from modules.site_manager import SiteManager
     from modules.backup import BackupManager
     from modules.pefi import PreEmptiveFirewall
+    from modules.updater import Updater
 
     db_path = os.environ.get("DB_PATH", "/var/lib/syamadmin/syamadmin.db")
+
+    # K-1: Aktifkan WAL mode SEKALI sebelum modul apa pun membuka koneksi.
+    # journal_mode=WAL adalah properti persisten file DB (tersimpan di header),
+    # jadi cukup di-set sekali agar 3 task paralel (bot, monitor, PeFi) bisa
+    # baca-tulis tanpa saling mengunci ("database is locked").
+    try:
+        import sqlite3
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        _wal = sqlite3.connect(db_path)
+        _wal.execute("PRAGMA journal_mode=WAL")
+        _wal.execute("PRAGMA synchronous=NORMAL")
+        _wal.close()
+        logger.info("SQLite WAL mode aktif (akses konkuren aman).")
+    except Exception as e:
+        logger.warning(f"Gagal mengaktifkan WAL mode: {e}")
 
     # Initialize modules
     executor = CommandExecutor(db_path=db_path)
@@ -106,6 +122,12 @@ async def main():
         notifier=notifier,
         db_path=db_path,
         config=dict(os.environ),
+        monitor=monitor,
+    )
+    updater = Updater(
+        executor=executor,
+        config=dict(os.environ),
+        install_dir=os.path.dirname(os.path.abspath(__file__)),
     )
 
     # Module registry for the AI brain and bot
@@ -120,6 +142,7 @@ async def main():
         "executor": executor,
         "notifier": notifier,
         "pefi": pefi,
+        "updater": updater,
     }
 
     # Initialize Telegram bot
@@ -148,12 +171,22 @@ async def main():
 
     logger.info("🟢 SyamAdmin Agent is running!")
 
-    # Send startup notification
+    # Send startup notification (+ tawarkan onboarding profil bila belum diisi)
     try:
+        onboarding = ""
+        try:
+            if brain.is_profile_empty():
+                onboarding = (
+                    "\n\n👋 *Belum ada profil.* Ketik `/profile setup` agar Jarwo "
+                    "mengenalmu (nama, peran, zona waktu) & lebih personal."
+                )
+        except Exception:
+            pass
         await notifier.send(
             f"🟢 *SyamAdmin Agent Started*\n"
             f"Server: `{os.environ.get('SERVER_NAME', 'VPS')}`\n"
-            f"Status: Online & Ready"
+            f"Versi: `{updater.get_local_version()}`\n"
+            f"Status: Online & Ready{onboarding}"
         )
     except Exception as e:
         logger.warning(f"Failed to send startup notification: {e}")

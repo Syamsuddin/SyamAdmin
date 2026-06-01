@@ -8,9 +8,44 @@ import logging
 import os
 import re
 import sqlite3
+from datetime import datetime
 from typing import Optional
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9 (tidak diharapkan, tapi aman)
+    ZoneInfo = None
+
 logger = logging.getLogger("syamadmin.brain")
+
+# ──────────────────────────────────────────────────────────────────────────
+# PROFIL & KONTEKS — data awal yang membuat SyamAdmin "kenal" admin & server-nya.
+#
+# Disimpan di tabel user_memory (Pilar 2) dengan prefix:
+#   profile.<key>  → identitas/preferensi ADMIN (manusia)
+#   server.<key>   → konteks SERVER (peran/fungsi)
+# Tiap field: key unik, scope, label (untuk pertanyaan wizard), contoh, required.
+# Urutan list = urutan pertanyaan saat onboarding step-by-step.
+# ──────────────────────────────────────────────────────────────────────────
+PROFILE_FIELDS = [
+    {"key": "name",         "scope": "profile", "label": "Nama lengkap",                       "example": "Budi Santoso",            "required": True},
+    {"key": "nickname",     "scope": "profile", "label": "Panggilan kesukaan",                 "example": "Boss / Pak Budi",         "required": False},
+    {"key": "job",          "scope": "profile", "label": "Pekerjaan / peran",                  "example": "Administrator IT",        "required": False},
+    {"key": "organization", "scope": "profile", "label": "Organisasi / instansi",             "example": "Dinas Pendidikan",        "required": False},
+    {"key": "location",     "scope": "profile", "label": "Lokasi / kota",                      "example": "Kandangan, HSS",          "required": False},
+    {"key": "timezone",     "scope": "profile", "label": "Zona waktu (IANA)",                  "example": "Asia/Jakarta",            "required": False},
+    {"key": "language",     "scope": "profile", "label": "Bahasa pilihan (id/en)",            "example": "id",                      "required": False},
+    {"key": "hobby",        "scope": "profile", "label": "Hobi / minat",                       "example": "mancing, ngoprek server", "required": False},
+    {"key": "comm_style",   "scope": "profile", "label": "Gaya komunikasi (santai/formal/ringkas)", "example": "santai",           "required": False},
+    {"key": "role",         "scope": "server",  "label": "Peran server (produksi/staging/dev)", "example": "produksi",              "required": False},
+    {"key": "purpose",      "scope": "server",  "label": "Fungsi utama server",                "example": "web SPMB sekolah",        "required": False},
+]
+
+_PROFILE_KEY_INDEX = {f["key"]: f for f in PROFILE_FIELDS}
+
+_HARI_ID = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+_BULAN_ID = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni",
+             "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
 
 # Single source of truth for the model — override via CLAUDE_MODEL env var
 _AI_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
@@ -86,6 +121,14 @@ asisten pribadi admin VPS Ubuntu via Telegram.
 - Kalau melihat potensi masalah dari data konteks (CPU tinggi, disk hampir penuh, belum backup \
   lama, service mati), Jarwo langsung mention — tidak nunggu ditanya
 
+=== MENGENAL ADMIN & WAKTU ===
+Konteks bisa memuat profil admin (nama, panggilan, pekerjaan, lokasi, hobi) dan waktu sistem \
+(tanggal, hari, jam). Manfaatkan secara natural — bukan dipamerkan:
+- Sapa admin dengan panggilan/nama yang dia pilih (mis. "Boss Budi"), jangan generik bila nama diketahui.
+- Sesuaikan salam dengan waktu nyata: pagi/siang/sore/malam dari konteks, jangan menebak.
+- Boleh mengaitkan hobi/pekerjaan untuk analogi ringan SESEKALI, jangan berlebihan.
+- Jika profil belum ada di konteks, jangan mengarang — sapa wajar dan boleh sarankan `/profile setup`.
+
 === CARA BERKOMUNIKASI ===
 Gunakan field `message` untuk respons Jarwo sebelum/saat aksi dijalankan.
 Gunakan field `suggestion` untuk saran proaktif SETELAH aksi selesai.
@@ -144,7 +187,72 @@ PENTING tentang STATE server:
 Jika perintah berbahaya atau ambigu, set confirmation_needed=true dan jelaskan risiko dalam gaya \
 Jarwo — jujur, tidak menakut-nakuti, tapi pastikan admin paham.
 Jika perintah tidak jelas, JANGAN panggil tool — tanya balik dengan santai khas Jarwo.
+
+=== PEDOMAN KEAMANAN & ROUTING (WAJIB DIPATUHI) ===
+Selalu set confirmation_needed=true untuk aksi yang sulit dibatalkan atau berdampak luas:
+- provisioner.install_lemp (mengubah banyak paket sistem sekaligus)
+- site_manager.remove_site (menghapus konfigurasi & berpotensi data situs)
+- backup.restore (MENIMPA data saat ini — sangat destruktif)
+- security.harden_ssh, firewall.deny_port / reset, dan perubahan port SSH \
+  (salah langkah bisa mengunci admin dari servernya sendiri)
+- executor.run_command dengan perintah bebas apa pun
+
+Untuk aksi baca-saja yang aman (status, services, disk_usage, top_processes, list_sites, \
+list_backups, list_rules, audit non-destruktif), confirmation_needed=false — langsung jalankan.
+
+Saat memilih module/action:
+- Cocokkan maksud admin ke module yang paling spesifik; jangan paksa pakai executor.run_command \
+  bila sudah ada action khusus (mis. restart layanan → executor.service_restart, bukan run_command).
+- Untuk perintah majemuk yang jelas berurutan, isi `steps` sesuai uratan yang diminta admin, \
+  jangan menggabung jadi satu run_command panjang.
+- Hormati STATE server di konteks: jangan menyarankan aksi yang prasyaratnya belum terpenuhi \
+  (mis. enable_ssl sebelum site dibuat, atau add_site sebelum LEMP terpasang).
+
+Gaya pesan: tetap ringkas. Untuk hasil baik-baik saja cukup 1–2 kalimat. Untuk aksi berisiko, \
+jelaskan SATU kalimat dampaknya sebelum minta konfirmasi. Jangan mengulang isi perintah admin \
+kata per kata — langsung ke inti dan tindakan.
 """
+
+# ──────────────────────────────────────────────────────────────────────────
+# PEFI_SYSTEM_PROMPT — prompt khusus analisis keamanan (M-2).
+#
+# SENGAJA TANPA persona Jarwo. Nama aplikasi adalah SyamAdmin; "Jarwo" hanya
+# sapaan/candaan kosmetik di percakapan biasa, TIDAK boleh masuk ke penilaian
+# atau verdict keamanan sistem. Keputusan blokir firewall harus murni faktual,
+# tenang, dan berbasis bukti — bukan gaya bercanda.
+# ──────────────────────────────────────────────────────────────────────────
+PEFI_SYSTEM_PROMPT = """Kamu adalah mesin analisis keamanan jaringan untuk SyamAdmin — \
+sistem deteksi ancaman pre-emptive pada server Ubuntu. Tugasmu murni teknis: menilai daftar \
+anomali traffic yang terdeteksi dan menetapkan tindakan firewall yang tepat untuk setiap IP \
+mencurigakan. Jawablah faktual dan tenang — tanpa persona, tanpa sapaan, tanpa candaan.
+
+=== PRINSIP PENILAIAN ===
+- Akurasi di atas segalanya. False positive (memblokir pengguna sah) sama berbahayanya dengan \
+  false negative (membiarkan serangan lewat). Timbang keduanya secara eksplisit.
+- BLOCK hanya bila bukti kuat dan polanya jelas menyerang: port scan masif, SYN flood, \
+  brute-force SSH gigih, atau recidivist (IP yang pernah diblokir lalu kembali menyerang).
+- THROTTLE untuk traffic agresif yang belum tentu jahat: lonjakan mendadak, request tinggi \
+  tapi pola masih wajar.
+- MONITOR bila mencurigakan namun bukti belum cukup — biarkan baseline terus belajar.
+- IGNORE bila kemungkinan besar false positive: traffic legitimate, crawler mesin pencari \
+  resmi (Googlebot, Bingbot), health check, atau monitoring uptime.
+
+=== PERTIMBANGAN KONTEKS ===
+- IP yang memindai banyak port layanan yang TIDAK terbuka = aktivitas scanning, lebih mencurigakan.
+- Brute-force SSH gigih dari satu IP = kandidat BLOCK berdurasi panjang.
+- Recidivist = naikkan tingkat keseriusan dan perpanjang durasi blokir.
+- Crawler/monitoring resmi yang kebetulan agresif = IGNORE atau MONITOR, jangan diblokir.
+- Perhatikan konteks server (layanan & port aktif) untuk menilai apakah target masuk akal.
+
+=== KALIBRASI KEPUTUSAN ===
+- confidence: cerminkan kekuatan bukti yang sebenarnya (0.0–1.0). Auto-block hanya terpicu \
+  pada confidence sangat tinggi, jadi jangan melebih-lebihkan.
+- block_duration_hours: 1–6 untuk pelanggaran ringan, 24 untuk serangan jelas, \
+  0 (permanen) hanya untuk recidivist berat.
+- reason: ringkas, faktual, bahasa Indonesia.
+- risk_if_wrong: jelaskan dampak konkret bila verdict ini ternyata keliru.
+
+Gunakan HANYA tool `analyze_network_threats` untuk menyampaikan keputusanmu."""
 
 # Tool khusus PeFi — analisis ancaman jaringan dan keputusan blokir
 PEFI_ANALYSIS_TOOL = {
@@ -433,14 +541,119 @@ class AIBrain:
             logger.warning(f"store_user_preference warning: {e}")
 
     def get_user_preferences(self) -> dict:
-        """Pilar 2: ambil semua preferensi admin."""
+        """Pilar 2: ambil preferensi admin generik.
+
+        Field profil (`profile.*`) & konteks server (`server.*`) DIKECUALIKAN —
+        keduanya disurfacing terpisah lewat get_profile_context() agar tidak
+        terduplikasi & lebih rapi di prompt.
+        """
         try:
             conn = sqlite3.connect(self.db_path)
             rows = conn.execute("SELECT key, value FROM user_memory").fetchall()
             conn.close()
-            return {k: v for k, v in rows}
+            return {
+                k: v for k, v in rows
+                if not (k.startswith("profile.") or k.startswith("server."))
+            }
         except Exception:
             return {}
+
+    # ---------------- Profil admin & konteks server (data awal) -------------
+
+    def set_profile_value(self, key: str, value: str) -> bool:
+        """Set satu field profil/server (key harus terdaftar di PROFILE_FIELDS)."""
+        field = _PROFILE_KEY_INDEX.get(key)
+        if not field:
+            return False
+        self.store_user_preference(f"{field['scope']}.{key}", str(value)[:200])
+        return True
+
+    def get_profile(self) -> dict:
+        """Ambil seluruh field profil+server (key sudah di-strip prefix scope)."""
+        out = {}
+        try:
+            conn = sqlite3.connect(self.db_path)
+            rows = conn.execute(
+                "SELECT key, value FROM user_memory "
+                "WHERE key LIKE 'profile.%' OR key LIKE 'server.%'"
+            ).fetchall()
+            conn.close()
+            for k, v in rows:
+                out[k.split(".", 1)[1]] = v
+        except Exception:
+            pass
+        return out
+
+    def is_profile_empty(self) -> bool:
+        """True bila admin belum mengisi profil sama sekali."""
+        return not self.get_profile()
+
+    def clear_profile(self) -> None:
+        """Hapus seluruh data profil & konteks server."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.execute("DELETE FROM user_memory WHERE key LIKE 'profile.%' OR key LIKE 'server.%'")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"clear_profile warning: {e}")
+
+    def get_profile_context(self) -> str:
+        """Ringkasan profil admin + server untuk konteks AI (manusiawi)."""
+        prof = self.get_profile()
+        if not prof:
+            return ""
+        admin_bits, server_bits = [], []
+        for f in PROFILE_FIELDS:
+            v = prof.get(f["key"])
+            if not v:
+                continue
+            (admin_bits if f["scope"] == "profile" else server_bits).append(f"{f['label']}: {v}")
+        lines = []
+        if admin_bits:
+            lines.append("Profil admin — " + "; ".join(admin_bits))
+        if server_bits:
+            lines.append("Konteks server — " + "; ".join(server_bits))
+        return "\n".join(lines)
+
+    def get_admin_nickname(self) -> str:
+        """Panggilan untuk admin: nickname → nama → 'Boss'."""
+        p = self.get_profile()
+        return (p.get("nickname") or p.get("name") or "Boss").strip() or "Boss"
+
+    def get_admin_timezone(self) -> str:
+        """Zona waktu admin: profil → env TZ → default Asia/Jakarta."""
+        tz = (self.get_profile().get("timezone") or "").strip()
+        return tz or os.environ.get("TZ") or "Asia/Jakarta"
+
+    def get_system_context(self) -> str:
+        """Konteks waktu sistem (tanggal, hari, jam) sadar-zona-waktu admin.
+
+        VOLATIL — selalu dikirim di blok messages (tidak di-cache).
+        """
+        tzname = self.get_admin_timezone()
+        now = datetime.now()
+        if ZoneInfo is not None:
+            try:
+                now = datetime.now(ZoneInfo(tzname))
+            except Exception:
+                now = datetime.now()
+                tzname = "waktu server"
+        hari = _HARI_ID[now.weekday()]
+        bulan = _BULAN_ID[now.month]
+        jam = now.hour
+        if 4 <= jam < 11:
+            salam = "pagi"
+        elif 11 <= jam < 15:
+            salam = "siang"
+        elif 15 <= jam < 19:
+            salam = "sore"
+        else:
+            salam = "malam"
+        return (
+            f"Waktu sekarang: {hari}, {now.day} {bulan} {now.year}, "
+            f"pukul {now:%H:%M} ({tzname}) — waktu {salam}."
+        )
 
     def add_to_chat_history(self, role: str, content: str) -> None:
         """Pilar 3: simpan satu turn percakapan (sudah diredaksi)."""
@@ -589,8 +802,9 @@ class AIBrain:
                 # Prompt caching (#7): tandai prefix statis (tools + system) sebagai
                 # cacheable agar tidak ditagih penuh tiap panggilan /ai. Cache-control
                 # pada blok system mencakup tools yang mendahuluinya. Aktif bila prefix
-                # >= minimum token model (Haiku 2048; Sonnet/Opus 1024) — di bawah itu
-                # ditandai aman tanpa efek, dan otomatis berlaku saat prompt membesar.
+                # >= minimum token model (Haiku 2048; Sonnet/Opus 1024). Setelah K-4,
+                # SYSTEM_PROMPT diperluas hingga prefix (tools+system) melampaui 2048
+                # token sehingga cache kini AKTIF juga di Haiku, bukan hanya Sonnet/Opus.
                 system=[{
                     "type": "text",
                     "text": SYSTEM_PROMPT,
@@ -942,9 +1156,11 @@ class AIBrain:
             response = await client.messages.create(
                 model=self.model,
                 max_tokens=1536,
+                # M-2: pakai PEFI_SYSTEM_PROMPT (analisis keamanan murni),
+                # BUKAN persona Jarwo — verdict keamanan harus faktual & tenang.
                 system=[{
                     "type": "text",
-                    "text": SYSTEM_PROMPT,
+                    "text": PEFI_SYSTEM_PROMPT,
                     "cache_control": {"type": "ephemeral"},
                 }],
                 tools=[PEFI_ANALYSIS_TOOL],
