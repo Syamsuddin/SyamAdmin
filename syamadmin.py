@@ -64,6 +64,7 @@ async def main():
     from modules.firewall import FirewallManager
     from modules.site_manager import SiteManager
     from modules.backup import BackupManager
+    from modules.pefi import PreEmptiveFirewall
 
     db_path = os.environ.get("DB_PATH", "/var/lib/syamadmin/syamadmin.db")
 
@@ -98,6 +99,14 @@ async def main():
         notifier=notifier,
         backup_dir=os.environ.get("BACKUP_DIR", "/var/backups/syamadmin"),
     )
+    pefi = PreEmptiveFirewall(
+        executor=executor,
+        firewall=firewall,
+        brain=brain,
+        notifier=notifier,
+        db_path=db_path,
+        config=dict(os.environ),
+    )
 
     # Module registry for the AI brain and bot
     modules = {
@@ -110,6 +119,7 @@ async def main():
         "brain": brain,
         "executor": executor,
         "notifier": notifier,
+        "pefi": pefi,
     }
 
     # Initialize Telegram bot
@@ -131,9 +141,10 @@ async def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, handle_signal, sig)
 
-    # Start background tasks
+    # Start background tasks (3 concurrent asyncio tasks)
     monitor_task = asyncio.create_task(monitor.run_loop())
     bot_task = asyncio.create_task(bot.run())
+    pefi_task = asyncio.create_task(pefi.run_loop())
 
     logger.info("🟢 SyamAdmin Agent is running!")
 
@@ -152,11 +163,13 @@ async def main():
 
     # Cleanup
     logger.info("Shutting down tasks...")
+    pefi.stop()
     monitor_task.cancel()
     bot_task.cancel()
+    pefi_task.cancel()
 
     try:
-        await asyncio.gather(monitor_task, bot_task, return_exceptions=True)
+        await asyncio.gather(monitor_task, bot_task, pefi_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
 
