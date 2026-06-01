@@ -15,6 +15,38 @@ logger = logging.getLogger("syamadmin.brain")
 # Single source of truth for the model — override via CLAUDE_MODEL env var
 _AI_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 
+# Daftar model terkini Anthropic beserta harga resmi (USD per juta token).
+# Sumber: https://platform.claude.com/docs/en/about-claude/models/overview
+AVAILABLE_MODELS: dict[str, dict] = {
+    "claude-haiku-4-5-20251001": {
+        "name": "Claude Haiku 4.5",
+        "tier": "fast",
+        "input_usd_per_mtok": 1.0,
+        "output_usd_per_mtok": 5.0,
+        "context_window": "200k",
+        "speed": "Tercepat",
+        "note": "Default SyamAdmin — cepat & hemat",
+    },
+    "claude-sonnet-4-6": {
+        "name": "Claude Sonnet 4.6",
+        "tier": "balanced",
+        "input_usd_per_mtok": 3.0,
+        "output_usd_per_mtok": 15.0,
+        "context_window": "1M",
+        "speed": "Cepat",
+        "note": "Keseimbangan kecepatan & kecerdasan terbaik",
+    },
+    "claude-opus-4-8": {
+        "name": "Claude Opus 4.8",
+        "tier": "flagship",
+        "input_usd_per_mtok": 5.0,
+        "output_usd_per_mtok": 25.0,
+        "context_window": "1M",
+        "speed": "Sedang",
+        "note": "Model paling canggih Anthropic",
+    },
+}
+
 # Redaksi rahasia (#4 plan): cegah kredensial tersimpan plaintext di memori SQLite.
 # Wizard provisioning men-generate & menampilkan password DB; tanpa redaksi, ia
 # akan ikut tersimpan di chat_history / long_term_memory.
@@ -38,13 +70,47 @@ def redact_secrets(text: str) -> str:
 _PRICE_INPUT_PER_TOKEN = 0.000001
 _PRICE_OUTPUT_PER_TOKEN = 0.000005
 
-SYSTEM_PROMPT = """Kamu adalah SyamAdmin, AI sysadmin agent yang mengelola server Ubuntu 22.04 VPS.
-Kamu menerima perintah dalam bahasa Indonesia atau Inggris dari admin via Telegram.
+SYSTEM_PROMPT = """Kamu adalah Jarwo, AI sysadmin senior dengan pengalaman 15 tahun mengelola server Linux \
+di berbagai skala — dari VPS personal sampai infrastruktur enterprise. Sekarang kamu bekerja sebagai \
+asisten pribadi admin VPS Ubuntu via Telegram.
 
-Tugas kamu:
-1. Pahami intent dari perintah admin
-2. Tentukan modul mana yang harus dijalankan
-3. Return JSON response dengan aksi yang harus dilakukan
+=== KEPRIBADIAN JARWO ===
+- Ramah, hangat, dan suka bercanda ringan — tapi tetap profesional dan bisa diandalkan
+- Sering pakai sapaan "Boss" atau "Bos" untuk admin; sesekali pakai ekspresi santai seperti \
+  "mantap", "siap boss", "gas lah", "oke beres", "tenang boss Jarwo handle"
+- Jujur dan langsung: kalau ada masalah serius, sampaikan terus terang tapi tidak bikin panik
+- Proaktif: setelah menyelesaikan satu tugas, Jarwo sering kasih saran lanjutan yang relevan \
+  berdasarkan kondisi server, riwayat percakapan, dan insting sysadmin senior
+- Tidak lebay: kalau semuanya baik-baik saja, bilang singkat dan positif
+- Punya selera humor ringan soal situasi teknis — tapi tidak pernah meremehkan masalah
+- Kalau melihat potensi masalah dari data konteks (CPU tinggi, disk hampir penuh, belum backup \
+  lama, service mati), Jarwo langsung mention — tidak nunggu ditanya
+
+=== CARA BERKOMUNIKASI ===
+Gunakan field `message` untuk respons Jarwo sebelum/saat aksi dijalankan.
+Gunakan field `suggestion` untuk saran proaktif SETELAH aksi selesai.
+
+Saran di `suggestion` harus:
+- Terasa natural, seperti saran teman sysadmin yang paham situasi — bukan notifikasi robot
+- Relevan dengan konteks: kondisi server saat ini, aksi yang baru dilakukan, riwayat chat
+- Singkat dan actionable — kalau bisa, sertakan perintah yang bisa langsung dicopy
+- Kadang bercanda ringan kalau situasinya memungkinkan
+- BOLEH kosong string jika benar-benar tidak ada saran relevan
+
+Contoh `suggestion` yang baik (sesuaikan dengan konteks nyata):
+- Setelah backup: "Omong-omong boss, mumpung baru backup — coba cek dulu disk-nya cukup nggak \
+  buat backup berikutnya? Ketik `/ai cek disk` kalau mau 😄"
+- Setelah restart nginx: "Btw boss, log error nginx tadi ada nggak ya? Jarwo saranin cek sebentar, \
+  bisa pakai `/logs nginx`"
+- Saat CPU tinggi dari konteks: "Eh boss Jarwo notice CPU-nya lagi di atas 80% nih — \
+  mau cek proses yang paling rakus? Ketik `/ai top proses` aja"
+- Setelah add site: "Jangan lupa aktifkan SSL-nya boss! `/site ssl namadomain.com` — \
+  biar Google juga seneng 🔒"
+- Kalau disk >85%: "Warning boss — disk sudah hampir penuh. Mau Jarwo bantu bersih-bersih \
+  log lama atau cek backup yang bisa dihapus?"
+
+=== TUGAS TEKNIS ===
+Kamu menerima perintah dari admin via Telegram dan menentukan aksi yang tepat pada server Ubuntu.
 
 Modul yang tersedia:
 - provisioner: Setup LEMP stack (nginx, mysql, php), install packages
@@ -59,8 +125,7 @@ Untuk MENJALANKAN perintah, PANGGIL tool `execute_sysadmin_action` dengan argume
 Jika perintah MAJEMUK (beberapa aksi sekaligus, mis. "backup db lalu restart nginx lalu ubah port ssh"),
 isi field `steps` dengan daftar aksi BERURUTAN sesuai urutan diminta. Untuk aksi TUNGGAL, kosongkan `steps`
 dan isi module/action/params seperti biasa.
-Jika perintah tidak jelas/ambigu, JANGAN panggil tool — cukup balas dengan teks pertanyaan
-klarifikasi dalam bahasa Indonesia.
+Jika perintah tidak jelas/ambigu, JANGAN panggil tool — tanya balik dengan gaya Jarwo yang santai.
 
 Contoh aksi per modul (gunakan nama alias berikut, sistem akan menerjemahkan):
 - provisioner: install_lemp, install_package, setup_composer
@@ -73,11 +138,12 @@ Contoh aksi per modul (gunakan nama alias berikut, sistem akan menerjemahkan):
 
 PENTING tentang STATE server:
 - Jika konteks menunjukkan "LEMP stack: BELUM terpasang", JANGAN rutekan ke add_site atau enable_ssl.
-  JANGAN panggil tool — balas teks yang menyarankan user menjalankan `/provision` atau `/setup` dulu.
+  JANGAN panggil tool — balas teks Jarwo yang menyarankan `/provision` atau `/setup` dulu.
 - Jika user minta restore, set confirmation_needed=true karena restore bersifat DESTRUKTIF.
 
-Jika perintah berbahaya atau ambigu, set confirmation_needed=true dan jelaskan risikonya di field message.
-Jika perintah tidak jelas, JANGAN panggil tool — balas teks klarifikasi.
+Jika perintah berbahaya atau ambigu, set confirmation_needed=true dan jelaskan risiko dalam gaya \
+Jarwo — jujur, tidak menakut-nakuti, tapi pastikan admin paham.
+Jika perintah tidak jelas, JANGAN panggil tool — tanya balik dengan santai khas Jarwo.
 """
 
 # Definisi tool untuk native tool-use (#2): menggantikan parsing JSON-dalam-teks
@@ -108,7 +174,15 @@ DISPATCH_TOOL = {
                 "type": "boolean",
                 "description": "true bila aksi berbahaya, destruktif, atau ambigu",
             },
-            "message": {"type": "string", "description": "pesan ramah untuk admin dalam bahasa Indonesia"},
+            "message": {"type": "string", "description": "respons Jarwo sebelum/saat aksi — dalam karakter Jarwo yang ramah dan santai"},
+            "suggestion": {
+                "type": "string",
+                "description": (
+                    "Saran proaktif Jarwo SETELAH aksi selesai — berdasarkan konteks server, "
+                    "riwayat chat, dan insting sysadmin. Natural dan actionable. "
+                    "Kosongkan jika tidak ada saran relevan."
+                ),
+            },
             "steps": {
                 "type": "array",
                 "description": (
@@ -203,6 +277,32 @@ class AIBrain:
             conn.close()
         except Exception as e:
             logger.warning(f"Brain DB init warning: {e}")
+
+    def set_model(self, model_id: str) -> bool:
+        """Switch model AI secara runtime dan simpan ke config.env."""
+        if model_id not in AVAILABLE_MODELS:
+            return False
+        self.model = model_id
+        info = AVAILABLE_MODELS[model_id]
+        # Update harga global agar /token tetap akurat setelah switch
+        global _PRICE_INPUT_PER_TOKEN, _PRICE_OUTPUT_PER_TOKEN
+        _PRICE_INPUT_PER_TOKEN = info["input_usd_per_mtok"] / 1_000_000
+        _PRICE_OUTPUT_PER_TOKEN = info["output_usd_per_mtok"] / 1_000_000
+        # Simpan ke config.env agar bertahan setelah restart
+        config_path = os.environ.get("CONFIG_PATH", "/etc/syamadmin/config.env")
+        try:
+            with open(config_path, "r") as f:
+                content = f.read()
+            if re.search(r"^CLAUDE_MODEL=", content, re.MULTILINE):
+                content = re.sub(r"^CLAUDE_MODEL=.*$", f"CLAUDE_MODEL={model_id}", content, flags=re.MULTILINE)
+            else:
+                content += f"\nCLAUDE_MODEL={model_id}\n"
+            with open(config_path, "w") as f:
+                f.write(content)
+            logger.info(f"Model switched to {model_id}, saved to {config_path}")
+        except Exception as e:
+            logger.warning(f"Model switched to {model_id} (runtime only, config save failed: {e})")
+        return True
 
     def log_token_usage(self, action: str, input_tokens: int, output_tokens: int, model: str):
         """Log token consumption metrics into SQLite database."""
@@ -385,7 +485,7 @@ class AIBrain:
                 action=action,
                 input_tokens=response.usage.input_tokens,
                 output_tokens=response.usage.output_tokens,
-                model=_AI_MODEL,
+                model=self.model,
             )
 
     @staticmethod
@@ -425,7 +525,7 @@ class AIBrain:
             messages.append({"role": "user", "content": prompt})
 
             response = await client.messages.create(
-                model=_AI_MODEL,
+                model=self.model,
                 max_tokens=1024,
                 # Prompt caching (#7): tandai prefix statis (tools + system) sebagai
                 # cacheable agar tidak ditagih penuh tiap panggilan /ai. Cache-control
@@ -455,6 +555,7 @@ class AIBrain:
                         "params": inp.get("params") or {},
                         "confirmation_needed": bool(inp.get("confirmation_needed", False)),
                         "message": inp.get("message", ""),
+                        "suggestion": inp.get("suggestion", ""),
                     }
                     # Multi-step (#planner): sertakan steps bila ada & valid (>1)
                     steps = inp.get("steps") or []
@@ -555,7 +656,7 @@ class AIBrain:
         try:
             client = self._get_client()
             response = await client.messages.create(
-                model=_AI_MODEL,
+                model=self.model,
                 max_tokens=1024,
                 messages=[{
                     "role": "user",
@@ -594,7 +695,7 @@ class AIBrain:
                 f"```\n{log_content[:2500]}\n```"
             )
             response = await client.messages.create(
-                model=_AI_MODEL,
+                model=self.model,
                 max_tokens=1024,
                 system=(
                     "Kamu adalah SyamAdmin, agen AI sysadmin. Tugas kamu adalah mendiagnosis log dari layanan yang mengalami crash dan menyusun usulan perintah perbaikan otomatis (Auto-Repair) yang AMAN.\n"
@@ -633,7 +734,7 @@ class AIBrain:
         try:
             client = self._get_client()
             response = await client.messages.create(
-                model=_AI_MODEL,
+                model=self.model,
                 max_tokens=1024,
                 system=(
                     "Kamu adalah SyamAdmin, agen AI sysadmin. Tugas kamu adalah menerjemahkan permintaan penjadwalan bahasa alami admin menjadi ekspresi cron standar Linux.\n"
@@ -677,7 +778,7 @@ class AIBrain:
         try:
             client = self._get_client()
             response = await client.messages.create(
-                model=_AI_MODEL,
+                model=self.model,
                 max_tokens=1536,
                 system=(
                     "Kamu adalah SyamAdmin, agen AI sysadmin. Tugas kamu adalah menganalisis ringkasan tren utilitas server (CPU, RAM, Disk, Swap) dan memberikan usulan optimasi sistem (Nginx, MySQL, Swap, PHP-FPM) yang paling cocok.\n"
@@ -709,7 +810,7 @@ class AIBrain:
         try:
             client = self._get_client()
             response = await client.messages.create(
-                model=_AI_MODEL,
+                model=self.model,
                 max_tokens=1536,
                 messages=[{
                     "role": "user",
@@ -737,7 +838,7 @@ class AIBrain:
         try:
             client = self._get_client()
             response = await client.messages.create(
-                model=_AI_MODEL, max_tokens=512,
+                model=self.model, max_tokens=512,
                 system=("Kamu SyamAdmin. Jelaskan error sysadmin berikut dalam bahasa "
                         "Indonesia sederhana untuk pemula: apa artinya & 1-2 langkah perbaikan. "
                         "Singkat, tanpa jargon."),

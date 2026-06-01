@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 from modules.monitor import MANAGED_SERVICES
+from modules.brain import AVAILABLE_MODELS
 
 logger = logging.getLogger("syamadmin.bot")
 
@@ -108,6 +109,7 @@ HELP_TEXT = """
 `/cron [jadwal bebas]` — Penjadwalan natural language (AI)
    contoh: `/cron backup db tiap jam 3 pagi`
 `/token` — Statistik & biaya token AI
+`/model` — Lihat & ganti model AI (haiku/sonnet/opus)
 
 *Lainnya:*
 `/confirm <OTP>` — Konfirmasi aksi berisiko
@@ -785,7 +787,12 @@ class SyamAdminBot:
         # Execute the parsed action
         response = await self._execute_ai_action(result)
         brain.add_to_chat_history("assistant", response)
-        await self._edit(msg,response, parse_mode="Markdown")
+        await self._edit(msg, response, parse_mode="Markdown")
+
+        # Tampilkan saran proaktif Jarwo jika ada
+        suggestion = result.get("suggestion", "").strip()
+        if suggestion:
+            await self._reply(update, f"💡 *Jarwo:* _{suggestion}_", parse_mode="Markdown")
 
     async def _execute_ai_action(self, parsed: dict) -> str:
         """Execute an AI-parsed action through the appropriate module."""
@@ -1107,6 +1114,77 @@ class SyamAdminBot:
         )
         await self._edit(msg,report, parse_mode="Markdown")
 
+    async def cmd_model(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Tampilkan atau ganti model AI yang digunakan SyamAdmin."""
+        if not await self._guard(update):
+            return
+
+        brain = self.modules.get("brain")
+        current = getattr(brain, "model", "?")
+
+        # Tanpa argumen → tampilkan daftar
+        if not context.args:
+            lines = ["🧠 *Model AI SyamAdmin*\n"]
+            lines.append(f"Model aktif: `{current}`\n")
+            lines.append("*Model tersedia (terkini):*\n")
+            for model_id, info in AVAILABLE_MODELS.items():
+                marker = "✅" if model_id == current else "○"
+                idr_in = int(info["input_usd_per_mtok"] * 16300)
+                idr_out = int(info["output_usd_per_mtok"] * 16300)
+                lines.append(
+                    f"{marker} `{model_id}`\n"
+                    f"   {info['name']} — {info['speed']}\n"
+                    f"   Input: ${info['input_usd_per_mtok']}/MTok (≈Rp{idr_in:,}/MTok)\n"
+                    f"   Output: ${info['output_usd_per_mtok']}/MTok (≈Rp{idr_out:,}/MTok)\n"
+                    f"   _{info['note']}_\n"
+                )
+            lines.append("Ganti model: `/model haiku` · `/model sonnet` · `/model opus`")
+            lines.append("atau gunakan ID penuh: `/model claude-sonnet-4-6`")
+            await self._reply(update, "\n".join(lines), parse_mode="Markdown")
+            return
+
+        # Resolusi shorthand → full model ID
+        shorthand = {
+            "haiku": "claude-haiku-4-5-20251001",
+            "sonnet": "claude-sonnet-4-6",
+            "opus": "claude-opus-4-8",
+        }
+        target = context.args[0].lower()
+        model_id = shorthand.get(target, target)
+
+        if model_id not in AVAILABLE_MODELS:
+            ids = "\n".join(f"• `{k}`" for k in AVAILABLE_MODELS)
+            await self._reply(
+                update,
+                f"❌ Model tidak dikenal: `{target}`\n\nPilihan valid:\n{ids}\n\n"
+                f"Atau gunakan shorthand: `haiku` · `sonnet` · `opus`",
+                parse_mode="Markdown",
+            )
+            return
+
+        if model_id == current:
+            await self._reply(update, f"ℹ️ Model sudah aktif: `{model_id}`", parse_mode="Markdown")
+            return
+
+        if brain and brain.set_model(model_id):
+            info = AVAILABLE_MODELS[model_id]
+            idr_in = int(info["input_usd_per_mtok"] * 16300)
+            idr_out = int(info["output_usd_per_mtok"] * 16300)
+            await self._reply(
+                update,
+                f"✅ *Model berhasil diganti*\n\n"
+                f"• Model baru: `{model_id}`\n"
+                f"• Nama: {info['name']}\n"
+                f"• Kecepatan: {info['speed']}\n"
+                f"• Input: ${info['input_usd_per_mtok']}/MTok (≈Rp{idr_in:,})\n"
+                f"• Output: ${info['output_usd_per_mtok']}/MTok (≈Rp{idr_out:,})\n\n"
+                f"_{info['note']}_\n\n"
+                f"Perubahan langsung aktif dan disimpan ke config.env.",
+                parse_mode="Markdown",
+            )
+        else:
+            await self._reply(update, "❌ Gagal mengganti model.", parse_mode="Markdown")
+
     async def cmd_cron(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Natural language scheduling via AI."""
         if not await self._guard(update):
@@ -1289,7 +1367,10 @@ class SyamAdminBot:
         elif action == "ai":
             await self._reply(update,"⚙️ Mengeksekusi aksi AI yang dikonfirmasi...")
             response = await self._execute_ai_action(pending["result"])
-            await self._reply(update,response, parse_mode="Markdown")
+            await self._reply(update, response, parse_mode="Markdown")
+            suggestion = pending.get("result", {}).get("suggestion", "").strip()
+            if suggestion:
+                await self._reply(update, f"💡 *Jarwo:* _{suggestion}_", parse_mode="Markdown")
 
         elif action == "plan":
             await self._execute_multi_step_plan(update, pending["plan"])
@@ -1461,6 +1542,7 @@ class SyamAdminBot:
         app.add_handler(CommandHandler("audit", self.cmd_audit))
         app.add_handler(CommandHandler("ai", self.cmd_ai))
         app.add_handler(CommandHandler("token", self.cmd_token))
+        app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("cron", self.cmd_cron))
         app.add_handler(CommandHandler("optimize", self.cmd_optimize))
         app.add_handler(CommandHandler("security_report", self.cmd_security_report))
@@ -1484,6 +1566,7 @@ class SyamAdminBot:
             BotCommand("logs", "Lihat log"),
             BotCommand("ai", "AI command"),
             BotCommand("token", "Statistik Token AI"),
+            BotCommand("model", "Lihat & ganti model AI"),
             BotCommand("cron", "AI Task Scheduler"),
             BotCommand("optimize", "AI Resource Optimizer"),
             BotCommand("restore", "Restore dari backup"),
