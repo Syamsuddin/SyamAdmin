@@ -132,6 +132,8 @@ Agen kini ber-memori, bukan sekadar reaktif — berbasis SQLite:
 - **Pilar 2 (User Preferences)**: Preferensi admin (versi PHP, timezone, dll.) disimpan permanen di `user_memory`.
 - **Pilar 3 (Chat History)**: Sliding window 8 turn terakhir dikirim ke AI sebagai konteks multi-giliran.
 - **Pilar 4 (Long-Term Memory + FTS5)**: Pelajaran insiden & rencana sukses dicatat di `long_term_memory`, dapat dicari relevan via SQLite **FTS5** full-text search (fallback LIKE jika FTS5 tak tersedia).
+- **Profil Admin & Konteks Server**: identitas admin (`profile.*`) dan konteks server (`server.*`) disimpan di `user_memory`, di-surface terpisah dari preferensi generik. Membuat Jarwo menyapa dengan nama, paham peran & zona waktu admin. Lihat [§ Data Awal & Onboarding](#-data-awal--onboarding-personalisasi-jarwo).
+- **Konteks Waktu Sistem**: tanggal, hari, dan jam nyata (sadar zona-waktu admin) diinjeksikan ke setiap perintah AI sehingga salam & keputusan sesuai waktu (pagi/siang/sore/malam) — tidak menebak.
 - **Redaksi rahasia otomatis**: password/token/API key disensor (`[REDACTED]`) sebelum disimpan ke memori.
 - **Retention otomatis**: metrics (30 hari), audit log (90 hari), chat history (14 hari), long_term_memory (max 1000 baris) — dipangkas sekali per 24 jam.
 
@@ -290,6 +292,77 @@ sudo journalctl -u syamadmin -f
 
 ---
 
+## 🧩 Data Awal & Onboarding (Personalisasi Jarwo)
+
+Agar SyamAdmin punya **konteks lengkap** sejak awal, sistem mengenal tiga lapis data. Lapis 1
+wajib diisi saat instalasi; Lapis 2–3 diisi lewat onboarding interaktif (atau slash command) dan
+disuntikkan ke setiap perintah AI bersama **konteks waktu sistem**.
+
+### Lapis 1 — Konfigurasi (wajib, `/etc/syamadmin/config.env`)
+
+- **`TELEGRAM_BOT_TOKEN`** (wajib) — token Bot Telegram dari BotFather.
+- **`TELEGRAM_ADMIN_ID`** (wajib) — Telegram user ID admin tunggal.
+- **`ANTHROPIC_API_KEY`** (opsional) — tanpa ini fitur AI nonaktif (fallback keyword).
+- **`SERVER_NAME`** (opsional, default `VPS`), **`SSH_PORT`** (default `22`).
+- Lainnya (model AI, threshold monitor, konfigurasi PeFi, retensi DB) punya default — lihat `config.env.example`.
+
+### Lapis 2 — Profil Admin (`profile.*` di `user_memory`)
+
+Identitas manusia di balik server — membuat Jarwo menyapa & berkomunikasi personal.
+
+- **`name`** (wajib) — nama lengkap.
+- **`nickname`** — panggilan kesukaan (mis. "Boss", "Pak Budi").
+- **`job`** — pekerjaan / peran · **`organization`** — organisasi / instansi · **`location`** — lokasi / kota.
+- **`timezone`** — zona waktu IANA (mis. `Asia/Jakarta`); dasar konteks jam.
+- **`language`** — bahasa pilihan (`id`/`en`) · **`hobby`** — hobi/minat (untuk analogi ringan).
+- **`comm_style`** — gaya komunikasi (`santai`/`formal`/`ringkas`).
+
+### Lapis 3 — Konteks Server (`server.*` di `user_memory`)
+
+- **`role`** — peran server (`produksi`/`staging`/`dev`).
+- **`purpose`** — fungsi utama (mis. "web SPMB sekolah").
+
+### Konteks Waktu Sistem (otomatis, tanpa input)
+
+Setiap perintah AI menerima tanggal, hari, dan jam **nyata** dalam zona waktu admin (`profile.timezone`
+→ env `TZ` → default `Asia/Jakarta`), lengkap dengan periode salam (pagi/siang/sore/malam). Bersifat
+volatil sehingga **tidak ikut prompt cache**.
+
+### Cara Mengisi — Onboarding
+
+1. **Otomatis saat pertama jalan**: notifikasi startup & `/start` mendeteksi profil kosong dan menawarkan `/profile setup`.
+2. **Wizard tanya-jawab**: `/profile setup` menanyakan tiap field langkah demi langkah (ketik `lewati` untuk opsional, `batal` untuk berhenti).
+3. **Per-field cepat**: `/profile set <field> <nilai>` (mis. `/profile set timezone Asia/Makassar`).
+4. **Lihat / hapus**: `/profile` menampilkan profil; `/profile reset` menghapus (perlu konfirmasi).
+
+> Privasi: profil adalah data milik admin sendiri di DB lokal server. Pola rahasia (password/token/key)
+> tetap disensor otomatis (`[REDACTED]`) di lapisan memori lain.
+
+---
+
+## 🔄 Self-Update dari GitHub (`/update`)
+
+SyamAdmin bisa **memperbarui dirinya sendiri** langsung dari Telegram — tanpa SSH, tanpa `git` di
+VPS. Pendekatan **detached self-healing + mesin tarball**:
+
+- **`/update check`** — bandingkan `VERSION` lokal vs `raw.githubusercontent.com/<repo>/<branch>/VERSION`.
+- **`/update now`** (OTP) — memicu `scripts/update.sh` secara **terlepas** (`setsid`+`nohup`) sehingga
+  tetap berjalan meski service di-restart di tengah proses. Tahapannya:
+  1. **Backup** `/opt/syamadmin` (kecuali `venv`, `scratch`, `*.db`) ke `/var/lib/syamadmin/backups/`.
+  2. **Unduh** tarball branch dari `codeload.github.com` → ekstrak ke temp → validasi isi.
+  3. **Ganti file** aplikasi (`cp -a`, `venv`/config/`*.db` tidak tersentuh) + `pip install -r requirements.txt`.
+  4. **Restart** service → **health-check** (`systemctl is-active`).
+  5. **Auto-rollback** ke backup bila service baru gagal naik.
+- Hasil akhir (sukses / rollback) dikirim balik ke Telegram oleh skrip setelah daemon online lagi.
+
+Konfigurasi: `GITHUB_REPO` (default `Syamsuddin/SyamAdmin`), `UPDATE_BRANCH` (default `main`). Setiap
+rilis cukup menaikkan file `VERSION` di root repo agar terdeteksi. Versi aktif tampil di `/status`,
+notifikasi startup, dan `/update`.
+
+> Catatan: `/update` = self-update **aplikasi SyamAdmin**. Untuk update **paket OS** (apt) gunakan `/sysupdate`.
+
+---
+
 ## 📱 Telegram Commands Reference
 
 ### 🤖 Fitur Cerdas (AI & Advanced v3.0)
@@ -298,11 +371,13 @@ sudo journalctl -u syamadmin -f
 |---------|-------------|-------------------|
 | `/ai <perintah bebas>` | Perintah bahasa alami; AI memilih aksi tunggal ATAU menyusun rencana multi-langkah (autopilot) | OTP untuk aksi/rencana berisiko |
 | `/site wizard` | Membuka panduan interaktif langkah-demi-langkah setup website + DB + SSL | **OTP Dinamis** sebelum eksekusi |
-| `/security_report` | Mengurai Fail2Ban & auth.log, AI menyusun laporan ancaman eksekutif | Informasi (Aman langsung) |
-| `/harden_ssh_port <PORT>` | Memindahkan port SSH default ke port non-standar pilihan Anda (5-layer safety check) | **OTP + 5-Layer Connection Test** |
+| `/security report` | Mengurai Fail2Ban & auth.log, AI menyusun laporan ancaman eksekutif (alias: `/security_report`) | Informasi (Aman langsung) |
+| `/security ssh-port <PORT>` | Memindahkan port SSH default ke port non-standar pilihan Anda (5-layer safety check) (alias: `/harden_ssh_port`) | **OTP + 5-Layer Connection Test** |
 | `/optimize` | Menganalisis log metrik 7 hari, merekomendasikan tuning performa LEMP | **OTP Dinamis** sebelum eksekusi |
 | `/cron <Perintah Bebas>` | Menjadwalkan tugas berkala dengan instruksi bahasa alami | **OTP Dinamis** sebelum eksekusi |
 | `/token` | Menampilkan statistik kuota token Claude API dan biaya riil (USD & IDR) | Informasi (Aman langsung) |
+| `/model [haiku\|sonnet\|opus]` | Lihat & ganti model AI (default: Haiku 4.5 ~Rp 500/hari; Sonnet ~Rp 5.000/hari, Opus ~Rp 50.000/hari) | Informasi (Aman langsung) |
+| `/profile` | Lihat/isi profil admin & konteks server (wizard `setup`, `set <field> <nilai>`, `reset`) agar Jarwo personal & sadar waktu | `reset` butuh konfirmasi |
 
 ### 🖥 Perintah Utama (Core System)
 
@@ -312,15 +387,19 @@ sudo journalctl -u syamadmin -f
 | `/status` | Dashboard lengkap: identitas server & IP (lokal+publik), resource bar, status layanan, firewall & port listen, Fail2Ban, web stack, AI engine, & Memory Core |
 | `/services` | Memeriksa status kesehatan dari semua managed service (nginx, mysql, php8.3-fpm, fail2ban, ufw, ssh) |
 | `/setup` | Memulai wizard interaktif onboarding server langkah-demi-langkah |
-| `/provision` | Menginstall penuh LEMP Stack 7-langkah (Update → Nginx → MySQL 8 → PHP 8.3 + 14 ext → Composer → Certbot → Swap 2GB) | OTP |
-| `/logs [service]` | Membaca 30 baris log terakhir; service: `nginx`, `mysql`, `auth`, `syslog`, `fail2ban` (whitelist anti path-traversal) |
+| `/provision` | Menginstall penuh LEMP Stack 7-langkah: Update → Nginx → MySQL 8 → PHP 8.3 + 14 ext → Composer → Certbot → Swap 2GB (OTP) |
+| `/logs [layanan] [baris]` | Membaca N baris log terakhir (default 30, maks 200); layanan: `nginx`, `nginx-access`, `mysql`, `auth`, `syslog`, `fail2ban`, `syamadmin` (whitelist anti path-traversal). Contoh: `/logs nginx 100` |
+| `/service <restart\|stop\|start\|reload\|status> <nama>` | Kontrol layanan systemd langsung tanpa AI (`stop` butuh OTP); validasi nama + via `service_action` arg-list |
 | `/audit` | Melihat 15 entri riwayat eksekusi shell terbaru yang dicatat oleh Command Executor |
 | `/backup` | Full backup: database MySQL (all-databases, single-transaction, gzip) + web files (tar.gz) |
 | `/backup db` | Backup databases saja; pre-check MySQL aktif, verifikasi ukuran file |
 | `/backup files` | Backup `/var/www`, `/etc/nginx`, `/etc/php` |
 | `/backup list` | Menampilkan 20 backup terbaru beserta ukuran dan tanggal |
 | `/restore <file>` | Memulihkan data dari file backup `.sql.gz` atau `.tar.gz` (OTP + path-traversal protection) |
-| `/help` | Bantuan lengkap |
+| `/update` | **Self-update SyamAdmin dari GitHub**: `/update check` (cek versi) · `/update now` (backup → unduh tarball → ganti file → restart → health-check, auto-rollback) (OTP) |
+| `/sysupdate` | Menjalankan `apt-get update && apt-get -y upgrade` paket OS (OTP) |
+| `/reboot` | Memulai ulang server `systemctl reboot` (OTP) |
+| `/help` | Bantuan lengkap (dibangun otomatis dari registry command tunggal) |
 
 ### 🌐 Virtual Host & SSL
 
@@ -338,15 +417,62 @@ sudo journalctl -u syamadmin -f
 
 | Command | Deskripsi |
 |---------|-------------|
-| `/security` | Menjalankan audit keamanan komprehensif: SSH config, root login, Fail2Ban, UFW, unattended-upgrades, open ports, pending updates, recent logins |
-| `/security_report` | Laporan AI ancaman keamanan dari auth.log + Fail2Ban |
-| `/harden` | Hardening menyeluruh: SSH self-healing + Fail2Ban (nginx-aware jails) + Firewall UFW + Auto-update |
-| `/harden_ssh_port <PORT>` | Pindah port SSH dengan 5-layer safety (validate → UFW → config → sshd-test → verify) | OTP |
-| `/firewall` | Menampilkan status dan aturan firewall UFW verbose |
+| `/security` atau `/security audit` | Audit keamanan komprehensif: SSH config, root login, Fail2Ban, UFW, unattended-upgrades, open ports, pending updates, recent logins |
+| `/security report` | Laporan AI ancaman keamanan dari auth.log + Fail2Ban (alias: `/security_report`) |
+| `/security harden` | Hardening menyeluruh: SSH self-healing + Fail2Ban (nginx-aware jails) + Firewall UFW + Auto-update (alias: `/harden`) |
+| `/security ssh-port <PORT>` | Pindah port SSH dengan 5-layer safety, validate → UFW → config → sshd-test → verify (alias: `/harden_ssh_port`, OTP) |
+| `/fw` atau `/fw status` | Menampilkan status dan aturan firewall UFW verbose (alias: `/firewall`) |
 | `/fw allow <PORT>` | Membuka akses port tertentu pada firewall UFW |
-| `/fw deny <PORT>` | Menutup port; proteksi khusus jika menutup port SSH aktif | OTP jika port SSH |
+| `/fw deny <PORT>` | Menutup port; proteksi khusus jika menutup port SSH aktif (OTP jika port SSH) |
 | `/fw rules` | Menampilkan list aturan firewall bernomor |
 | `/confirm <OTP>` | Konfirmasi aksi berisiko dengan kode OTP 4-digit |
+
+### 🛡️ PeFi — Pre-Emptive Firewall Agent
+
+| Command | Deskripsi |
+|---------|-------------|
+| `/pefi threats` | Daftar ancaman terdeteksi (IP source, rule, confidence, waktu) |
+| `/pefi rules` | Tampilkan UFW rules yang aktif sekarang (nomor, port, action) |
+| `/pefi report` | Analisis AI threat landscape dari data terakhir |
+| `/pefi health` | Status sistem PeFi (rule count, last scan, memory, uptime) |
+| `/pefi scan` | Trigger manual scan traffic sekarang (OTP) |
+| `/pefi block <ip> [jam]` | Block single IP untuk N jam durasi (backup rule, OTP) |
+| `/pefi unblock <ip>` | Hapus manual block dari IP (OTP) |
+| `/pefi whitelist <ip>` | Tambah IP ke trusted list (tidak pernah diblokir, OTP) |
+| `/pefi ignore <threat_id>` | Tandai ancaman sebagai false positive; AI learns (OTP) |
+| `/pefi autoblock [on\|off]` | Enable/disable auto-block HIGH/CRITICAL threats (confidence ≥95%, OTP) |
+
+---
+
+## 📊 Feature Inventory v3.1 — 30 Commands Across 13 Modules
+
+### Sistem Inti (6 commands)
+
+Dashboard & manajemen dasar: `/status`, `/services`, `/service`, `/logs`, `/audit`, `/help`
+
+### Provisioning & Setup (3 commands)
+Instalasi LEMP dari nol: `/start`, `/setup`, `/provision`
+
+### Manajemen Website (4 commands)
+Vhost Nginx + SSL: `/site add|ssl|list|remove`, `/site wizard`
+
+### Keamanan & Hardening (5 commands)
+SSH, Fail2Ban, UFW, audit: `/security audit|report|harden|ssh-port`, `/fw allow|deny|rules|status`
+
+### Backup & Restore (4 commands)
+Database + file: `/backup db|files|list`, `/restore`
+
+### AI & Otomasi (5 commands)
+Natural language, planning, tuning: `/ai`, `/cron`, `/optimize`, `/token`, `/model`
+
+### Profil & Konteks (1 command)
+Personalisasi admin: `/profile setup|set|reset`
+
+### System Control (3 commands)
+OS updates & restart: `/update check|now`, `/sysupdate`, `/reboot`
+
+### Pre-Emptive Firewall (5 commands)
+AI threat detection: `/pefi threats|rules|report|health|scan|block|unblock|whitelist|ignore|autoblock`
 
 ---
 
@@ -358,7 +484,7 @@ Setiap tindakan kritis yang bersifat destruktif atau mengubah konfigurasi sistem
 
 - Memiliki waktu kedaluwarsa ketat selama **60–120 detik** (tergantung jenis aksi).
 - Admin dapat menyetujui dengan `/confirm <OTP>` atau cukup membalas OTP-nya langsung di chat.
-- Aksi destruktif (`provision`, `remove_site`, `deny_ssh`, `change_ssh_port`, `restore`, `repair_service`, `wizard_provision`) **menolak kata afirmatif** seperti `ya/ok` — wajib kode OTP numerik.
+- Aksi destruktif (`provision`, `remove_site`, `deny_ssh`, `change_ssh_port`, `restore`, `repair_service`, `wizard_provision`, `service_stop`, `apt_upgrade`, `reboot`) **menolak kata afirmatif** seperti `ya/ok` — wajib kode OTP numerik.
 - Kata afirmatif (`ya`, `iya`, `ok`, `oke`, `yes`, `y`, `lanjut`, `setuju`, `gas`) hanya berlaku untuk aksi non-destruktif.
 
 ### 2. Safety Filter & Tokenized shlex

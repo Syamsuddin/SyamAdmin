@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 
 from modules.monitor import MANAGED_SERVICES
-from modules.brain import AVAILABLE_MODELS
+from modules.brain import AVAILABLE_MODELS, PROFILE_FIELDS
 
 logger = logging.getLogger("syamadmin.bot")
 
@@ -56,6 +56,7 @@ AFFIRMATIVE_WORDS = {"ya", "iya", "ok", "oke", "yes", "y", "lanjut", "setuju", "
 DESTRUCTIVE_ACTIONS = {
     "provision", "remove_site", "deny_ssh", "change_ssh_port",
     "restore", "repair_service", "wizard_provision",
+    "service_stop", "apt_upgrade", "reboot", "app_update",
 }
 
 # Aksi read-only (allowlist) — dipakai gating OTP orchestrator. Step plan yang
@@ -67,67 +68,99 @@ SAFE_READONLY_ACTIONS = {
     "get_disk_report", "get_top_processes", "get_connections",
 }
 
-HELP_TEXT = """
-🤖 *SyamAdmin — AI Sysadmin Agent*
+# ──────────────────────────────────────────────────────────────────────────
+# COMMAND REGISTRY — SUMBER KEBENARAN TUNGGAL
+#
+# Satu registry mendrive tiga hal sekaligus agar tidak pernah drift:
+#   1) registrasi CommandHandler   2) menu Telegram (set_my_commands)
+#   3) HELP_TEXT
+# Field per-entri: (command, handler_method, usage, help_desc, menu_desc)
+#   usage     : contoh argumen untuk HELP (boleh "")
+#   menu_desc : None → tidak dimunculkan di menu Telegram
+# ──────────────────────────────────────────────────────────────────────────
+COMMAND_REGISTRY = [
+    ("🖥 Server & Monitoring", [
+        ("status",   "cmd_status",   "",                                  "Status server lengkap (CPU, RAM, Disk, layanan)", "Status server"),
+        ("services", "cmd_services", "",                                  "Status semua layanan terkelola",                  "Status layanan"),
+        ("service",  "cmd_service",  "restart|stop|start|status <nama>",  "Kontrol layanan langsung (tanpa AI)",             "Kontrol layanan"),
+        ("logs",     "cmd_logs",     "[layanan] [baris]",                 "Lihat log (nginx, nginx-access, mysql, auth, syslog, fail2ban, syamadmin)", "Lihat log"),
+        ("audit",    "cmd_audit",    "",                                  "Riwayat perintah (audit log)",                    "Audit log"),
+        ("optimize", "cmd_optimize", "",                                  "Analisis tren + rekomendasi optimasi (AI)",       "Optimasi (AI)"),
+    ]),
+    ("🚀 Setup & Provisioning", [
+        ("setup",     "cmd_setup",     "", "Panduan setup server langkah demi langkah (pemula)", "Panduan setup pemula"),
+        ("provision", "cmd_provision", "", "Pasang LEMP stack dari awal (OTP)",                  "Pasang LEMP stack"),
+    ]),
+    ("🌐 Manajemen Site", [
+        ("site", "cmd_site", "add|list|ssl|remove|wizard …", "Kelola situs Nginx + SSL (ketik `/site` untuk detail)", "Kelola situs"),
+    ]),
+    ("🔐 Keamanan & Firewall", [
+        ("security", "cmd_security", "audit|report|harden|ssh-port <port>", "Audit, laporan AI, hardening, ubah port SSH", "Keamanan"),
+        ("fw",       "cmd_fw",       "status|allow|deny|rules <port>",      "Kelola firewall UFW",                         "Firewall UFW"),
+    ]),
+    ("💾 Backup & Restore", [
+        ("backup",  "cmd_backup",  "[db|files|list]", "Backup penuh / DB / file, atau daftar backup", "Backup"),
+        ("restore", "cmd_restore", "<file>",          "Pulihkan dari backup (OTP)",                    "Restore backup"),
+    ]),
+    ("🤖 AI & Otomatisasi", [
+        ("ai",    "cmd_ai",    "[perintah bebas]",    "Perintah natural language (mis. `/ai restart nginx`)", "Perintah AI"),
+        ("cron",  "cmd_cron",  "[jadwal bebas]",      "Penjadwalan natural language (mis. `/cron backup db jam 3 pagi`)", "Penjadwal AI"),
+        ("token", "cmd_token", "",                    "Statistik & biaya token AI",                          "Statistik token AI"),
+        ("model", "cmd_model", "[haiku|sonnet|opus]", "Lihat & ganti model AI",                              "Model AI"),
+    ]),
+    ("👤 Profil & Konteks", [
+        ("profile", "cmd_profile", "setup|set <field> <nilai>|reset",
+         "Profil admin & konteks server agar Jarwo lebih personal", "Profil admin"),
+    ]),
+    ("🛡️ PeFi — Pre-Emptive Firewall", [
+        ("pefi", "cmd_pefi", "threats|rules|report|health|scan|block|unblock|whitelist|ignore|autoblock",
+         "Firewall pre-emptive berbasis AI (ketik `/pefi` untuk detail)", "PeFi firewall AI"),
+    ]),
+    ("⚙️ Sistem", [
+        ("update",    "cmd_update",    "[check|now]", "Cek & pasang update SyamAdmin terbaru dari GitHub (OTP)", "Update SyamAdmin"),
+        ("sysupdate", "cmd_sysupdate", "",            "Update & upgrade paket OS via apt (OTP)",                 "Update paket OS"),
+        ("reboot",    "cmd_reboot",    "",            "Reboot server (OTP)",                                     "Reboot server"),
+        ("confirm",   "cmd_confirm",   "<OTP>",       "Konfirmasi aksi berisiko",                                None),
+        ("help",      "cmd_help",      "",            "Tampilkan bantuan ini",                                   "Bantuan"),
+    ]),
+]
 
-*Server & Monitoring:*
-`/status` — Status server (CPU, RAM, Disk)
-`/services` — Status semua managed services
-`/logs [service]` — Lihat log terbaru
-`/audit` — Lihat audit log perintah
-`/optimize` — Analisis tren + rekomendasi optimasi (AI)
+# Alias (tidak di menu) — kompatibilitas mundur untuk command yang kini digabung,
+# plus entry-point /start.
+COMMAND_ALIASES = [
+    ("start",            "cmd_start"),
+    ("firewall",         "cmd_firewall"),          # → /fw status
+    ("harden",           "cmd_harden"),            # → /security harden
+    ("security_report",  "cmd_security_report"),   # → /security report
+    ("harden_ssh_port",  "cmd_harden_ssh_port"),   # → /security ssh-port
+    ("svc",              "cmd_service"),           # → /service
+]
 
-*Setup & Provisioning:*
-`/setup` — Panduan setup server (pemula)
-`/provision` — Setup LEMP stack dari awal
 
-*Site Management:*
-`/site add domain.com` — Tambah site baru
-`/site list` — List semua site
-`/site ssl domain.com` — Aktifkan SSL
-`/site remove domain.com` — Hapus site
-`/site wizard` — Wizard interaktif buat site
+def _build_help_text() -> str:
+    """Bangun HELP_TEXT dari COMMAND_REGISTRY (sumber kebenaran tunggal)."""
+    lines = ["🤖 *SyamAdmin — AI Sysadmin Agent*\n"]
+    for title, entries in COMMAND_REGISTRY:
+        lines.append(f"*{title}:*")
+        for cmd, _handler, usage, desc, _menu in entries:
+            sig = f"/{cmd}" + (f" {usage}" if usage else "")
+            lines.append(f"`{sig}` — {desc}")
+        lines.append("")
+    lines.append("_Tip: ketik command tanpa argumen (mis. `/site`, `/fw`, `/security`, `/pefi`) untuk sub-bantuan._")
+    return "\n".join(lines)
 
-*Security & Firewall:*
-`/security` — Jalankan security audit
-`/security_report` — Laporan keamanan cerdas (AI)
-`/harden` — Hardening SSH + Fail2Ban
-`/harden_ssh_port <port>` — Ubah port SSH (OTP)
-`/firewall` — Status firewall
-`/fw allow 3306` — Buka port
-`/fw deny 3306` — Tutup port
 
-*Backup & Restore:*
-`/backup` — Full backup (DB + files)
-`/backup db` — Backup databases saja
-`/backup list` — List backup tersedia
-`/restore <file>` — Restore dari backup (OTP)
+def _build_menu_commands():
+    """Bangun daftar BotCommand untuk set_my_commands dari registry."""
+    cmds = []
+    for _title, entries in COMMAND_REGISTRY:
+        for cmd, _handler, _usage, _desc, menu in entries:
+            if menu:
+                cmds.append(BotCommand(cmd, menu))
+    return cmds
 
-*AI & Otomatisasi:*
-`/ai [perintah bebas]` — Perintah natural language
-   contoh: `/ai restart nginx` atau `/ai cek kenapa disk penuh`
-`/cron [jadwal bebas]` — Penjadwalan natural language (AI)
-   contoh: `/cron backup db tiap jam 3 pagi`
-`/token` — Statistik & biaya token AI
-`/model` — Lihat & ganti model AI (haiku/sonnet/opus)
 
-*🛡️ PeFi — Pre-Emptive Firewall:*
-`/pefi` — Status PeFi & statistik ancaman
-`/pefi threats` — Ancaman aktif yang dipantau AI
-`/pefi rules` — Daftar IP yang diblokir PeFi
-`/pefi report [jam]` — Laporan aktivitas (default 24 jam)
-`/pefi health` — Health check: FP rate, baseline quality, cleanup stats
-`/pefi scan` — Trigger analisis manual sekarang (OTP)
-`/pefi block <ip> [jam]` — Blokir IP manual (OTP)
-`/pefi unblock <ip>` — Hapus blokir IP (OTP)
-`/pefi whitelist <ip>` — Whitelist IP permanen (OTP)
-`/pefi ignore <id>` — Tandai ancaman sebagai false positive (OTP)
-`/pefi autoblock on|off` — Toggle auto-block tanpa OTP (OTP)
-
-*Lainnya:*
-`/confirm <OTP>` — Konfirmasi aksi berisiko
-`/help` — Bantuan ini
-"""
+HELP_TEXT = _build_help_text()
 
 
 class SyamAdminBot:
@@ -147,6 +180,24 @@ class SyamAdminBot:
     def _generate_otp(self) -> str:
         """Generate a cryptographically secure 4-digit numeric OTP."""
         return str(secrets.randbelow(9000) + 1000)
+
+    @staticmethod
+    def _otp_line(otp: str, seconds: int = 60) -> str:
+        """Kalimat konfirmasi OTP yang SERAGAM untuk seluruh flow.
+
+        Baik balas-angka langsung maupun `/confirm <otp>` sama-sama valid —
+        satu frasa konsisten menghindari kebingungan antar-command.
+        """
+        return f"Balas `{otp}` atau kirim `/confirm {otp}` untuk melanjutkan (berlaku {seconds} detik)."
+
+    def _arm_confirmation(self, action: str, otp: str, seconds: int = 60, **extra) -> None:
+        """Set pending confirmation secara konsisten (expiry seragam per-pemanggil)."""
+        self._pending_confirmations[self.admin_id] = {
+            "action": action,
+            "otp": otp,
+            "expires": datetime.now().timestamp() + seconds,
+            **extra,
+        }
 
     def _is_admin(self, update: Update) -> bool:
         return update.effective_user and update.effective_user.id == self.admin_id
@@ -210,11 +261,27 @@ class SyamAdminBot:
                 setup_hint = "\n\n🆕 Server baru terdeteksi! Ketik `/setup` untuk panduan langkah demi langkah."
         except Exception:
             pass
+
+        # Tawarkan pengisian profil bila admin belum kenalan
+        profile_hint = ""
+        brain = self.modules.get("brain")
+        greeting = "Halo"
+        try:
+            if brain and brain.is_profile_empty():
+                profile_hint = (
+                    "\n\n👋 Kita belum kenalan! Ketik `/profile setup` biar Jarwo bisa "
+                    "menyapa dengan namamu & paham konteks kerjamu."
+                )
+            elif brain:
+                greeting = f"Halo *{brain.get_admin_nickname()}*"
+        except Exception:
+            pass
+
         await self._reply(update,
             f"🤖 *SyamAdmin Agent*\n\n"
-            f"Server: `{self.server_name}`\n"
+            f"{greeting}! Server: `{self.server_name}`\n"
             f"Status: 🟢 Online\n\n"
-            f"Kirim /help untuk daftar perintah.{setup_hint}",
+            f"Kirim /help untuk daftar perintah.{setup_hint}{profile_hint}",
             parse_mode="Markdown",
         )
 
@@ -278,7 +345,9 @@ class SyamAdminBot:
         na = "_n/a_"
 
         # --- Identitas ---
-        ident = [f"🏷 Server : `{self.server_name}`"]
+        updater = self.modules.get("updater")
+        ver = updater.get_local_version() if updater else ""
+        ident = [f"🏷 Server : `{self.server_name}`" + (f"  • v`{ver}`" if ver else "")]
         if hostname:
             ident[0] += f"  (host: `{hostname}`)"
         if os_name:
@@ -382,7 +451,7 @@ class SyamAdminBot:
     async def cmd_services(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
-        msg = await self._reply(update,"⏳ Checking services...")
+        msg = await self._reply(update,"⏳ Mengecek status layanan...")
         report = await self.modules["monitor"].get_services_status()
         await self._edit(msg,report, parse_mode="Markdown")
 
@@ -394,14 +463,10 @@ class SyamAdminBot:
             "⚠️ *Provisioning LEMP Stack*\n\n"
             "Ini akan menginstall:\n"
             "• Nginx\n• MySQL 8\n• PHP 8.3 + extensions\n• Composer\n• Certbot\n\n"
-            f"Kirim `/confirm {otp}` untuk mengeksekusi (berlaku 60 detik).",
+            f"{self._otp_line(otp)}",
             parse_mode="Markdown",
         )
-        self._pending_confirmations[self.admin_id] = {
-            "action": "provision",
-            "otp": otp,
-            "expires": datetime.now().timestamp() + 60,
-        }
+        self._arm_confirmation("provision", otp, 60)
 
     async def cmd_confirm(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
@@ -462,99 +527,137 @@ class SyamAdminBot:
 
         elif action == "ssl" and len(args) >= 2:
             domain = args[1]
-            await self._reply(update,f"🔒 Setting up SSL for `{domain}`...", parse_mode="Markdown")
+            msg = await self._reply(update,f"🔒 Menyiapkan SSL untuk `{domain}`...", parse_mode="Markdown")
             result = await sm.enable_ssl(domain)
             result = await self._augment_failure("aktivasi SSL", result)
-            await self._reply(update,result, parse_mode="Markdown")
+            await self._edit(msg,result, parse_mode="Markdown")
 
         elif action == "remove" and len(args) >= 2:
             domain = args[1]
             otp = self._generate_otp()
             await self._reply(update,
                 f"🗑️ *Konfirmasi Hapus Site `{domain}`*\n\n"
-                f"Kirim `/confirm {otp}` untuk mengeksekusi (berlaku 60 detik).",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "remove_site",
-                "domain": domain,
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation("remove_site", otp, 60, domain=domain)
 
         else:
             await self._reply(update,"❌ Perintah site tidak valid. Kirim `/site` untuk bantuan.", parse_mode="Markdown")
 
     async def cmd_security(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Router keamanan: /security audit|report|harden|ssh-port <port>."""
         if not await self._guard(update):
             return
-        msg = await self._reply(update,"🔍 Running security audit...")
+        args = context.args or []
+        sub = args[0].lower() if args else "audit"
+
+        if sub == "audit":
+            await self._do_security_audit(update)
+        elif sub == "report":
+            await self._do_security_report(update)
+        elif sub == "harden":
+            await self._do_harden(update)
+        elif sub in ("ssh-port", "ssh_port", "sshport"):
+            await self._do_ssh_port(update, args[1:])
+        else:
+            await self._reply(update,
+                "🔐 *Penggunaan /security:*\n"
+                "`/security audit` — jalankan security audit\n"
+                "`/security report` — laporan keamanan cerdas (AI)\n"
+                "`/security harden` — hardening SSH + Fail2Ban + firewall + auto-update\n"
+                "`/security ssh-port <port>` — ubah port SSH (OTP)",
+                parse_mode="Markdown",
+            )
+
+    async def _do_security_audit(self, update: Update):
+        msg = await self._reply(update,"🔍 Menjalankan security audit...")
         result = await self.modules["security"].audit()
         await self._edit(msg,result, parse_mode="Markdown")
 
-    async def cmd_harden(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._guard(update):
-            return
-        await self._reply(update,"🔐 Starting hardening process...")
+    async def _do_harden(self, update: Update):
+        """Hardening menyeluruh dengan indikator progres bertahap."""
+        msg = await self._reply(update,"🔐 *Memulai hardening...*\n⏳ 1/4 SSH hardening", parse_mode="Markdown")
         r1 = await self.modules["security"].harden_ssh()
+        await self._edit(msg,"🔐 *Hardening...*\n✅ 1/4 SSH\n⏳ 2/4 Fail2Ban", parse_mode="Markdown")
         r2 = await self.modules["security"].setup_fail2ban()
+        await self._edit(msg,"🔐 *Hardening...*\n✅ 1/4 SSH\n✅ 2/4 Fail2Ban\n⏳ 3/4 Firewall", parse_mode="Markdown")
         r3 = await self.modules["firewall"].setup_defaults()
+        await self._edit(msg,"🔐 *Hardening...*\n✅ 1/4 SSH\n✅ 2/4 Fail2Ban\n✅ 3/4 Firewall\n⏳ 4/4 Auto-update", parse_mode="Markdown")
         r4 = await self.modules["security"].setup_auto_updates()
 
-        summary = f"🔐 *Hardening Complete*\n\n{r1}\n\n{r2}\n\n{r3}\n\n{r4}"
-        # Truncate if too long for Telegram
+        summary = f"🔐 *Hardening Selesai*\n\n{r1}\n\n{r2}\n\n{r3}\n\n{r4}"
         if len(summary) > 4000:
-            summary = summary[:3900] + "\n\n_(truncated)_"
-        await self._reply(update,summary, parse_mode="Markdown")
+            summary = summary[:3900] + "\n\n_(dipotong)_"
+        await self._edit(msg,summary, parse_mode="Markdown")
 
-    async def cmd_firewall(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def cmd_harden(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias: /security harden (kompatibilitas mundur)."""
         if not await self._guard(update):
             return
+        await self._do_harden(update)
+
+    async def cmd_firewall(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias: /fw status (kompatibilitas mundur)."""
+        if not await self._guard(update):
+            return
+        msg = await self._reply(update,"🧱 Mengambil status firewall...")
         result = await self.modules["firewall"].status()
-        await self._reply(update,result, parse_mode="Markdown")
+        await self._edit(msg,result, parse_mode="Markdown")
 
     async def cmd_fw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Quick firewall commands: /fw allow 3306, /fw deny 8080"""
+        """Firewall UFW: /fw status|allow|deny|rules <port>."""
         if not await self._guard(update):
             return
         args = context.args or []
         fm = self.modules["firewall"]
+        action = args[0].lower() if args else "status"
 
-        if len(args) < 2:
+        # status & rules: tidak butuh argumen port
+        if action == "status":
+            msg = await self._reply(update,"🧱 Mengambil status firewall...")
+            result = await fm.status()
+            await self._edit(msg,result, parse_mode="Markdown")
+            return
+        if action == "rules":
+            msg = await self._reply(update,"🧱 Memuat daftar rule...")
+            result = await fm.list_rules()
+            await self._edit(msg,result, parse_mode="Markdown")
+            return
+
+        if action not in ("allow", "deny") or len(args) < 2:
             await self._reply(update,
-                "Penggunaan:\n`/fw allow 3306` — buka port\n`/fw deny 3306` — tutup port\n`/fw rules` — list rules",
+                "🧱 *Penggunaan /fw:*\n"
+                "`/fw status` — status firewall\n"
+                "`/fw rules` — daftar rule\n"
+                "`/fw allow 3306` — buka port\n"
+                "`/fw deny 8080` — tutup port",
                 parse_mode="Markdown",
             )
             return
 
-        action = args[0].lower()
+        port = args[1]
         if action == "allow":
-            result = await fm.allow_port(args[1])
-        elif action == "deny":
-            port = args[1]
-            ssh_port = os.environ.get("SSH_PORT", "22")
-            if port == ssh_port or port == "22":
-                otp = self._generate_otp()
-                await self._reply(update,
-                    f"⚠️ *Peringatan Keamanan Port SSH ({port})*\n\n"
-                    "Anda akan menutup akses port SSH! Tindakan ini dapat mengunci akses Anda ke server.\n\n"
-                    f"Kirim `/confirm {otp}` untuk mengeksekusi (berlaku 60 detik).",
-                    parse_mode="Markdown",
-                )
-                self._pending_confirmations[self.admin_id] = {
-                    "action": "deny_ssh",
-                    "port": port,
-                    "otp": otp,
-                    "expires": datetime.now().timestamp() + 60,
-                }
-                return
-            result = await fm.deny_port(port)
-        elif action == "rules":
-            result = await fm.list_rules()
-        else:
-            result = "❌ Gunakan `allow`, `deny`, atau `rules`."
+            msg = await self._reply(update,f"🧱 Membuka port `{port}`...", parse_mode="Markdown")
+            result = await fm.allow_port(port)
+            await self._edit(msg,result, parse_mode="Markdown")
+            return
 
-        await self._reply(update,result, parse_mode="Markdown")
+        # action == "deny"
+        ssh_port = os.environ.get("SSH_PORT", "22")
+        if port == ssh_port or port == "22":
+            otp = self._generate_otp()
+            await self._reply(update,
+                f"⚠️ *Peringatan Keamanan Port SSH ({port})*\n\n"
+                "Anda akan menutup akses port SSH! Tindakan ini dapat mengunci akses Anda ke server.\n\n"
+                f"{self._otp_line(otp)}",
+                parse_mode="Markdown",
+            )
+            self._arm_confirmation("deny_ssh", otp, 60, port=port)
+            return
+        msg = await self._reply(update,f"🧱 Menutup port `{port}`...", parse_mode="Markdown")
+        result = await fm.deny_port(port)
+        await self._edit(msg,result, parse_mode="Markdown")
 
     async def cmd_backup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
@@ -562,19 +665,31 @@ class SyamAdminBot:
         args = context.args or []
         bm = self.modules["backup"]
 
+        if args and args[0] not in ("db", "files", "list"):
+            await self._reply(update,
+                "💾 *Penggunaan /backup:*\n"
+                "`/backup` — backup penuh (DB + file)\n"
+                "`/backup db` — backup database saja\n"
+                "`/backup files` — backup file situs saja\n"
+                "`/backup list` — daftar backup tersedia",
+                parse_mode="Markdown",
+            )
+            return
+
         if not args:
-            await self._reply(update,"💾 Starting full backup...")
+            msg = await self._reply(update,"💾 Memulai backup penuh...")
             result = await bm.backup_all()
         elif args[0] == "db":
+            msg = await self._reply(update,"💾 Backup database...")
             result = await bm.backup_db()
         elif args[0] == "files":
+            msg = await self._reply(update,"💾 Backup file situs...")
             result = await bm.backup_files()
-        elif args[0] == "list":
+        else:  # list
+            msg = await self._reply(update,"💾 Memuat daftar backup...")
             result = await bm.list_backups()
-        else:
-            result = "Penggunaan: `/backup` | `/backup db` | `/backup files` | `/backup list`"
 
-        await self._reply(update,result, parse_mode="Markdown")
+        await self._edit(msg,result, parse_mode="Markdown")
 
     async def cmd_restore(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Restore dari file backup dengan OTP confirmation."""
@@ -593,63 +708,214 @@ class SyamAdminBot:
             f"⚠️ *Konfirmasi Restore* (DESTRUKTIF!)\n\n"
             f"File: `{filename}`\n"
             f"Data saat ini akan ditimpa oleh isi backup.\n\n"
-            f"Kirim `/confirm {otp}` atau balas `{otp}` untuk melanjutkan.",
+            f"{self._otp_line(otp, 120)}",
             parse_mode="Markdown",
         )
-        self._pending_confirmations[self.admin_id] = {
-            "action": "restore",
-            "filename": filename,
-            "otp": otp,
-            "expires": datetime.now().timestamp() + 120,
-        }
+        self._arm_confirmation("restore", otp, 120, filename=filename)
 
     async def cmd_logs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
         args = context.args or []
-        service = args[0] if args else "syslog"
+        service = args[0].lower() if args else "syslog"
+
+        # Jumlah baris opsional (arg ke-2), clamp 1..200
+        lines_n = 30
+        if len(args) > 1 and args[1].isdigit():
+            lines_n = max(1, min(200, int(args[1])))
 
         log_map = {
             "nginx": "/var/log/nginx/error.log",
+            "nginx-access": "/var/log/nginx/access.log",
             "mysql": "/var/log/mysql/error.log",
             "auth": "/var/log/auth.log",
             "syslog": "/var/log/syslog",
             "fail2ban": "/var/log/fail2ban.log",
         }
 
-        # Hanya izinkan service yang ada di whitelist untuk mencegah path traversal
-        if service not in log_map:
+        # 'syamadmin' = log agen sendiri via journalctl (fallback ke LOG_FILE)
+        if service == "syamadmin":
+            log_file = os.environ.get("LOG_FILE", "/var/log/syamadmin/agent.log")
+            cmd = (
+                f"journalctl -u syamadmin -n {lines_n} --no-pager 2>/dev/null "
+                f"|| tail -n {lines_n} {log_file} 2>/dev/null "
+                f"|| echo 'Log SyamAdmin tidak ditemukan.'"
+            )
+        elif service in log_map:
+            log_path = log_map[service]
+            cmd = f"tail -n {lines_n} {log_path} 2>/dev/null || echo 'Log file tidak ditemukan: {log_path}'"
+        else:
             await self._reply(update,
-                f"❌ Service tidak dikenal: `{service}`\n\n"
-                f"Service yang tersedia: `nginx`, `mysql`, `auth`, `syslog`, `fail2ban`",
+                f"❌ Layanan log tidak dikenal: `{service}`\n\n"
+                f"Tersedia: `nginx`, `nginx-access`, `mysql`, `auth`, `syslog`, `fail2ban`, `syamadmin`\n"
+                f"Contoh: `/logs nginx 100`",
                 parse_mode="Markdown",
             )
             return
 
-        log_path = log_map[service]
-        r = await self.modules["executor"].run(
-            f"tail -30 {log_path} 2>/dev/null || echo 'Log file not found: {log_path}'",
-            module="bot",
-        )
-        await self._reply(update,
-            f"📋 *Log: {service}*\n```\n{r['stdout'][:3500]}\n```",
+        msg = await self._reply(update,f"📋 Mengambil {lines_n} baris log `{service}`...", parse_mode="Markdown")
+        r = await self.modules["executor"].run(cmd, module="bot", check=False)
+        await self._edit(msg,
+            f"📋 *Log: {service}* (≤{lines_n} baris)\n```\n{r['stdout'][:3500]}\n```",
             parse_mode="Markdown",
         )
+
+    async def cmd_service(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Kontrol layanan langsung: /service restart|stop|start|status <nama>."""
+        if not await self._guard(update):
+            return
+        args = context.args or []
+        valid_actions = ("restart", "stop", "start", "status", "reload")
+
+        if len(args) < 2 or args[0].lower() not in valid_actions:
+            await self._reply(update,
+                "🔧 *Penggunaan /service:*\n"
+                "`/service status <nama>` — cek status\n"
+                "`/service restart <nama>` — restart\n"
+                "`/service reload <nama>` — reload config\n"
+                "`/service start <nama>` — start\n"
+                "`/service stop <nama>` — stop (OTP)\n\n"
+                f"Layanan umum: {', '.join(f'`{s}`' for s in MANAGED_SERVICES)}",
+                parse_mode="Markdown",
+            )
+            return
+
+        action = args[0].lower()
+        service = args[1]
+        # Validasi nama layanan agar aman (service_action lewat run_exec arg-list)
+        if not re.match(r"^[a-zA-Z0-9@._\-]+$", service):
+            await self._reply(update,"❌ Nama layanan tidak valid.", parse_mode="Markdown")
+            return
+
+        # stop = berpotensi outage → wajib OTP
+        if action == "stop":
+            otp = self._generate_otp()
+            await self._reply(update,
+                f"⚠️ *Konfirmasi Stop Layanan*\n\n"
+                f"• Layanan: `{service}`\n"
+                f"Menghentikan layanan dapat menyebabkan downtime.\n\n"
+                f"{self._otp_line(otp)}",
+                parse_mode="Markdown",
+            )
+            self._arm_confirmation("service_stop", otp, 60, service=service)
+            return
+
+        msg = await self._reply(update,f"🔧 `{action}` layanan `{service}`...", parse_mode="Markdown")
+        r = await self.modules["executor"].service_action(service, action)
+        out = (r.get("stdout") or r.get("stderr") or "").strip()
+        icon = "✅" if r.get("success") else "❌"
+        await self._edit(msg,
+            f"{icon} *{action} `{service}`*\n```\n{out[:3000] or '(tidak ada output)'}\n```",
+            parse_mode="Markdown",
+        )
+
+    async def cmd_sysupdate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Update & upgrade paket OS via apt (OTP)."""
+        if not await self._guard(update):
+            return
+        otp = self._generate_otp()
+        await self._reply(update,
+            "⚠️ *Update & Upgrade Paket OS*\n\n"
+            "Akan menjalankan `apt-get update` lalu `apt-get upgrade -y`.\n"
+            "Proses bisa memakan beberapa menit dan memperbarui paket sistem.\n\n"
+            f"{self._otp_line(otp, 120)}",
+            parse_mode="Markdown",
+        )
+        self._arm_confirmation("apt_upgrade", otp, 120)
+
+    async def cmd_update(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Self-update SyamAdmin dari GitHub: /update [check|now]."""
+        if not await self._guard(update):
+            return
+        updater = self.modules.get("updater")
+        if not updater:
+            await self._reply(update, "❌ Modul updater tidak aktif.", parse_mode="Markdown")
+            return
+        args = context.args or []
+        sub = args[0].lower() if args else "check"
+
+        if sub in ("", "check", "cek"):
+            msg = await self._reply(update, "🔎 Mengecek versi terbaru di GitHub...")
+            res = await updater.check()
+            if not res.get("ok"):
+                await self._edit(msg, f"❌ Gagal cek update: {res.get('error')}", parse_mode="Markdown")
+                return
+            if res["update_available"]:
+                await self._edit(msg,
+                    f"⬆️ *Update SyamAdmin tersedia!*\n\n"
+                    f"• Versi sekarang : `{res['local']}`\n"
+                    f"• Versi terbaru  : `{res['remote']}`\n\n"
+                    f"Ketik `/update now` untuk memasang (backup + auto-rollback, perlu OTP).",
+                    parse_mode="Markdown",
+                )
+            else:
+                await self._edit(msg,
+                    f"✅ SyamAdmin sudah versi terbaru (`{res['local']}`).",
+                    parse_mode="Markdown",
+                )
+            return
+
+        if sub in ("now", "apply", "pasang", "upgrade"):
+            res = await updater.check()
+            local = res.get("local", "?")
+            remote = res.get("remote", "?")
+            if res.get("ok") and not res.get("update_available"):
+                await self._reply(update,
+                    f"✅ Sudah versi terbaru (`{local}`). Tidak ada yang perlu diupdate.\n"
+                    f"_Paksa pasang ulang? Jalankan lagi `/update now` setelah ada rilis baru._",
+                    parse_mode="Markdown",
+                )
+                return
+            otp = self._generate_otp()
+            await self._reply(update,
+                f"⚠️ *Konfirmasi Update SyamAdmin*\n\n"
+                f"• `{local}` → `{remote}`\n\n"
+                f"Proses: backup → unduh dari GitHub → ganti file → restart → "
+                f"health-check (auto-rollback bila gagal).\n"
+                f"⏳ Bot akan restart sebentar; hasil akhir dikirim otomatis.\n\n"
+                f"{self._otp_line(otp, 120)}",
+                parse_mode="Markdown",
+            )
+            self._arm_confirmation("app_update", otp, 120, target=remote)
+            return
+
+        await self._reply(update,
+            "🔄 *Penggunaan /update:*\n"
+            "`/update` atau `/update check` — cek versi terbaru di GitHub\n"
+            "`/update now` — pasang update (OTP)\n\n"
+            "_Update paket OS (apt) ada di `/sysupdate`._",
+            parse_mode="Markdown",
+        )
+
+    async def cmd_reboot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Reboot server (OTP)."""
+        if not await self._guard(update):
+            return
+        otp = self._generate_otp()
+        await self._reply(update,
+            "⚠️ *Konfirmasi Reboot Server*\n\n"
+            "Server akan dimulai ulang. Semua layanan akan terputus sesaat "
+            "dan bot tidak merespons hingga server kembali online.\n\n"
+            f"{self._otp_line(otp, 120)}",
+            parse_mode="Markdown",
+        )
+        self._arm_confirmation("reboot", otp, 120)
 
     async def cmd_audit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._guard(update):
             return
+        msg = await self._reply(update,"📋 Memuat audit log...")
         entries = await self.modules["executor"].get_recent_audit(limit=15)
         if not entries:
-            await self._reply(update,"📭 Belum ada audit log.")
+            await self._edit(msg,"📭 Belum ada audit log.")
             return
 
-        lines = ["📋 *Recent Audit Log*\n"]
+        lines = ["📋 *Audit Log Terbaru*\n"]
         for e in entries:
             icon = "✅" if e["status"] == "success" else "❌"
             lines.append(f"{icon} `{e['timestamp']}` [{e['module']}] {e['action'][:60]}")
 
-        await self._reply(update,"\n".join(lines), parse_mode="Markdown")
+        await self._edit(msg,"\n".join(lines), parse_mode="Markdown")
 
     async def cmd_ai(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Natural language command processing via AI Brain."""
@@ -702,7 +968,7 @@ class SyamAdminBot:
                 f"• *Solusi*: {diag.get('solution')}\n"
                 f"• *Perintah Perbaikan*: `{diag.get('repair_command')}`\n"
                 f"• *Risiko*: {diag.get('risk')}\n\n"
-                f"Kirim `/confirm {otp}` atau cukup balas dengan `{otp}` untuk melanjutkan.",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
             self._pending_confirmations[self.admin_id] = {
@@ -720,11 +986,21 @@ class SyamAdminBot:
         # Get current server context for AI (metrics + state)
         metrics = await self.modules["monitor"].collect_metrics()
         state = await self.modules["monitor"].get_state_context()
-        context_str = (
+
+        # Konteks waktu sistem + profil admin/server (volatil → bukan di prompt cache)
+        parts = []
+        sys_ctx = brain.get_system_context()
+        if sys_ctx:
+            parts.append(sys_ctx)
+        profile_ctx = brain.get_profile_context()
+        if profile_ctx:
+            parts.append(profile_ctx)
+        parts.append(
             f"CPU: {metrics['cpu_percent']}%, RAM: {metrics['ram_percent']}%, "
             f"Disk: {metrics['disk_percent']}%, Load: {metrics['load_1']}, "
             f"Uptime: {metrics['uptime_str']}\n{state}"
         )
+        context_str = "\n".join(parts)
 
         # Perkaya konteks dengan Memory Core: preferensi admin (Pilar 2) +
         # pelajaran relevan (Pilar 4)
@@ -784,7 +1060,7 @@ class SyamAdminBot:
                 f"Intent: {result['intent']}\n"
                 f"Aksi: {action_detail}\n\n"
                 f"{result['message']}{risk_note}\n\n"
-                f"Kirim `/confirm {otp}` untuk mengeksekusi (berlaku 60 detik).",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
             brain.add_to_chat_history("assistant", result["message"])
@@ -885,7 +1161,7 @@ class SyamAdminBot:
         )
         text = (
             f"{preview}\n\n_{result.get('message', 'Rencana siap dijalankan.')}_"
-            f"{risk_note}\n\nKirim `/confirm {otp}` untuk menjalankan (berlaku 120 detik)."
+            f"{risk_note}\n\n{self._otp_line(otp, 120)}"
         )
         self.modules["brain"].add_to_chat_history("assistant", result.get("message", "Rencana disusun."))
         await self._edit(msg, text, parse_mode="Markdown")
@@ -977,13 +1253,10 @@ class SyamAdminBot:
                 elif choice == "2":
                     del self._wizard_states[self.admin_id]
                     otp = self._generate_otp()
-                    self._pending_confirmations[self.admin_id] = {
-                        "action": "harden_all", "otp": otp,
-                        "expires": datetime.now().timestamp() + 120,
-                    }
+                    self._arm_confirmation("harden_all", otp, 120)
                     await self._reply(update,
                         f"🔐 Akan menjalankan hardening SSH + Fail2Ban + Firewall + Auto-update.\n"
-                        f"Kirim `/confirm {otp}` atau balas `{otp}`.",
+                        f"{self._otp_line(otp, 120)}",
                         parse_mode="Markdown",
                     )
                     return
@@ -1059,23 +1332,70 @@ class SyamAdminBot:
                 del self._wizard_states[self.admin_id]
                 
                 otp = self._generate_otp()
-                self._pending_confirmations[self.admin_id] = {
-                    "action": "wizard_provision",
-                    "domain": domain,
-                    "framework": framework,
-                    "db": need_db,
-                    "otp": otp,
-                    "expires": datetime.now().timestamp() + 120,
-                }
-                
+                self._arm_confirmation(
+                    "wizard_provision", otp, 120,
+                    domain=domain, framework=framework, db=need_db,
+                )
+
                 await self._reply(update,
                     f"📝 *Ringkasan Konfigurasi Website*\n\n"
                     f"• *Domain*: `{domain}`\n"
                     f"• *Framework/Platform*: `{framework}`\n"
                     f"• *Buat Database MySQL*: `{'Ya' if need_db else 'Tidak'}`\n\n"
                     f"⚠️ *Peringatan*: Proses ini akan mengubah konfigurasi Nginx dan Firewall.\n"
-                    f"Kirim `/confirm {otp}` atau cukup balas dengan `{otp}` untuk mengeksekusi.",
+                    f"{self._otp_line(otp, 120)}",
                     parse_mode="Markdown"
+                )
+                return
+
+            # Onboarding profil — tanya field PROFILE_FIELDS satu per satu
+            elif state == "PROFILE":
+                low = user_text.lower()
+                if low in ("batal", "cancel"):
+                    del self._wizard_states[self.admin_id]
+                    await self._reply(update,"❌ Pengisian profil dibatalkan.", parse_mode="Markdown")
+                    return
+
+                idx = wizard["idx"]
+                field = PROFILE_FIELDS[idx]
+                if low in ("lewati", "skip", "-"):
+                    if field["required"]:
+                        await self._reply(update,
+                            f"⚠️ Field ini wajib diisi.\n\n*{field['label']}*?\n_contoh: {field['example']}_",
+                            parse_mode="Markdown",
+                        )
+                        return
+                    # lewati: tidak menyimpan
+                else:
+                    wizard["data"][field["key"]] = user_text
+
+                idx += 1
+                wizard["idx"] = idx
+                if idx < len(PROFILE_FIELDS):
+                    nxt = PROFILE_FIELDS[idx]
+                    opt = "" if nxt["required"] else " _(ketik `lewati` bila kosong)_"
+                    await self._reply(update,
+                        f"{idx + 1}️⃣ *{nxt['label']}*?{opt}\n_contoh: {nxt['example']}_",
+                        parse_mode="Markdown",
+                    )
+                    return
+
+                # Selesai — simpan semua, sapa personal
+                data = wizard["data"]
+                del self._wizard_states[self.admin_id]
+                brain = self.modules["brain"]
+                for k, v in data.items():
+                    brain.set_profile_value(k, v)
+                nick = brain.get_admin_nickname()
+                filled = "\n".join(
+                    f"• {f['label']}: `{data[f['key']]}`"
+                    for f in PROFILE_FIELDS if f["key"] in data
+                ) or "_(tidak ada yang diisi)_"
+                await self._reply(update,
+                    f"✅ *Profil tersimpan!* Salam kenal, *{nick}* 🤝\n\n{filled}\n\n"
+                    "Mulai sekarang Jarwo akan menyapa & menyesuaikan konteks dengan profilmu.\n"
+                    "_Ubah kapan saja: `/profile set <field> <nilai>` atau `/profile setup`._",
+                    parse_mode="Markdown",
                 )
                 return
 
@@ -1198,6 +1518,96 @@ class SyamAdminBot:
         else:
             await self._reply(update, "❌ Gagal mengganti model.", parse_mode="Markdown")
 
+    async def cmd_profile(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Profil admin & konteks server: /profile [setup|set <field> <nilai>|reset]."""
+        if not await self._guard(update):
+            return
+        brain = self.modules["brain"]
+        args = context.args or []
+        sub = args[0].lower() if args else ""
+
+        # Tampilkan profil saat ini
+        if sub == "":
+            prof = brain.get_profile()
+            if not prof:
+                await self._reply(update,
+                    "👤 *Profil belum diisi.*\n\n"
+                    "Biar Jarwo bisa lebih personal (sapa dengan nama, paham konteks server & "
+                    "zona waktu kamu), yuk isi profil:\n"
+                    "• `/profile setup` — wizard tanya-jawab langkah demi langkah\n"
+                    "• `/profile set name Budi` — isi satu field saja",
+                    parse_mode="Markdown",
+                )
+                return
+            lines = ["👤 *Profil Admin & Konteks Server*\n"]
+            for f in PROFILE_FIELDS:
+                v = prof.get(f["key"])
+                mark = f"`{v}`" if v else "_(kosong)_"
+                lines.append(f"• {f['label']}: {mark}")
+            lines.append("\n_Ubah: `/profile setup` · `/profile set <field> <nilai>` · `/profile reset`_")
+            lines.append("Field: " + ", ".join(f"`{f['key']}`" for f in PROFILE_FIELDS))
+            await self._reply(update, "\n".join(lines), parse_mode="Markdown")
+            return
+
+        # Wizard tanya-jawab
+        if sub in ("setup", "wizard"):
+            self._wizard_states[self.admin_id] = {
+                "state": "PROFILE",
+                "idx": 0,
+                "data": {},
+                "expires": datetime.now().timestamp() + 600,
+            }
+            first = PROFILE_FIELDS[0]
+            await self._reply(update,
+                "👋 *Kenalan dulu yuk!*\n\n"
+                "Jarwo akan tanya beberapa hal singkat biar bisa melayani lebih personal.\n"
+                "Ketik `lewati` untuk melompati pertanyaan opsional, atau `batal` untuk berhenti.\n\n"
+                f"1️⃣ *{first['label']}*?\n_contoh: {first['example']}_",
+                parse_mode="Markdown",
+            )
+            return
+
+        # Set satu field
+        if sub == "set":
+            if len(args) < 3:
+                await self._reply(update,
+                    "❌ Format: `/profile set <field> <nilai>`\n"
+                    "Field: " + ", ".join(f"`{f['key']}`" for f in PROFILE_FIELDS),
+                    parse_mode="Markdown",
+                )
+                return
+            key = args[1].lower()
+            value = " ".join(args[2:])
+            if brain.set_profile_value(key, value):
+                await self._reply(update, f"✅ `{key}` = `{value}` tersimpan.", parse_mode="Markdown")
+            else:
+                await self._reply(update,
+                    f"❌ Field `{key}` tidak dikenal.\n"
+                    "Field valid: " + ", ".join(f"`{f['key']}`" for f in PROFILE_FIELDS),
+                    parse_mode="Markdown",
+                )
+            return
+
+        # Reset (konfirmasi ringan — bukan destruktif sistem, kata afirmatif OK)
+        if sub == "reset":
+            otp = self._generate_otp()
+            await self._reply(update,
+                "🗑️ *Reset Profil*\n\nSemua data profil admin & konteks server akan dihapus.\n\n"
+                f"Balas `ya` atau `{otp}` untuk konfirmasi (berlaku 60 detik).",
+                parse_mode="Markdown",
+            )
+            self._arm_confirmation("profile_reset", otp, 60)
+            return
+
+        await self._reply(update,
+            "👤 *Penggunaan /profile:*\n"
+            "`/profile` — lihat profil\n"
+            "`/profile setup` — wizard tanya-jawab\n"
+            "`/profile set <field> <nilai>` — isi satu field\n"
+            "`/profile reset` — hapus profil",
+            parse_mode="Markdown",
+        )
+
     async def cmd_pefi(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """PeFi — Pre-Emptive Firewall Agent command router."""
         if not await self._guard(update):
@@ -1245,14 +1655,10 @@ class SyamAdminBot:
                 update,
                 f"🛡️ *Konfirmasi PeFi Scan Manual*\n\n"
                 f"Akan memicu satu siklus analisis traffic sekarang.\n\n"
-                f"Balas dengan `{otp}` untuk melanjutkan (60 detik).",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "pefi_scan",
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation("pefi_scan", otp, 60)
 
         elif sub == "block":
             if len(args) < 2:
@@ -1266,16 +1672,10 @@ class SyamAdminBot:
                 f"🔒 *Konfirmasi Blokir IP*\n\n"
                 f"• IP: `{ip}`\n"
                 f"• Durasi: {hours} jam\n\n"
-                f"Balas dengan `{otp}` untuk memblokir (60 detik).",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "pefi_block",
-                "ip": ip,
-                "hours": hours,
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation("pefi_block", otp, 60, ip=ip, hours=hours)
 
         elif sub == "unblock":
             if len(args) < 2:
@@ -1287,15 +1687,10 @@ class SyamAdminBot:
                 update,
                 f"🔓 *Konfirmasi Hapus Blokir*\n\n"
                 f"• IP: `{ip}`\n\n"
-                f"Balas dengan `{otp}` untuk melanjutkan (60 detik).",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "pefi_unblock",
-                "ip": ip,
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation("pefi_unblock", otp, 60, ip=ip)
 
         elif sub == "whitelist":
             if len(args) < 2:
@@ -1309,16 +1704,10 @@ class SyamAdminBot:
                 f"✅ *Konfirmasi Whitelist IP*\n\n"
                 f"• IP: `{ip}`\n"
                 f"• Alasan: {reason}\n\n"
-                f"PeFi tidak akan memproses IP ini. Balas `{otp}` untuk konfirmasi (60 detik).",
+                f"PeFi tidak akan memproses IP ini.\n{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "pefi_whitelist",
-                "ip": ip,
-                "reason": reason,
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation("pefi_whitelist", otp, 60, ip=ip, reason=reason)
 
         elif sub == "ignore":
             if len(args) < 2 or not args[1].isdigit():
@@ -1330,15 +1719,10 @@ class SyamAdminBot:
                 update,
                 f"⬜ *Tandai Ancaman sebagai False Positive*\n\n"
                 f"• Threat ID: `{threat_id}`\n\n"
-                f"Balas `{otp}` untuk konfirmasi (60 detik).",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "pefi_ignore",
-                "threat_id": threat_id,
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation("pefi_ignore", otp, 60, threat_id=threat_id)
 
         elif sub == "autoblock":
             if len(args) < 2 or args[1].lower() not in ("on", "off"):
@@ -1358,15 +1742,10 @@ class SyamAdminBot:
                 update,
                 f"⚠️ *Konfirmasi {action_str} Auto-Block*\n\n"
                 f"{'Auto-block ON: ancaman HIGH/CRITICAL dengan confidence ≥ 95% diblokir TANPA konfirmasi admin.' if toggle == 'on' else 'Auto-block OFF: semua blokir butuh konfirmasi manual admin.'}\n\n"
-                f"Balas `{otp}` untuk melanjutkan (60 detik).",
+                f"{self._otp_line(otp)}",
                 parse_mode="Markdown",
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "pefi_autoblock",
-                "toggle": toggle,
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation("pefi_autoblock", otp, 60, toggle=toggle)
 
         else:
             await self._reply(
@@ -1407,17 +1786,15 @@ class SyamAdminBot:
             f"• *Tugas*: `{res['command']}`\n"
             f"• *Jadwal*: {res['readable_summary']}\n"
             f"• *Ekspresi Cron*: `{res['cron_expression']}`\n\n"
-            f"Kirim `/confirm {otp}` atau cukup balas dengan `{otp}` untuk melanjutkan.",
+            f"{self._otp_line(otp)}",
             parse_mode="Markdown",
         )
-        self._pending_confirmations[self.admin_id] = {
-            "action": "add_cron",
-            "cron_expression": res["cron_expression"],
-            "command": res["command"],
-            "readable_summary": res["readable_summary"],
-            "otp": otp,
-            "expires": datetime.now().timestamp() + 60,
-        }
+        self._arm_confirmation(
+            "add_cron", otp, 60,
+            cron_expression=res["cron_expression"],
+            command=res["command"],
+            readable_summary=res["readable_summary"],
+        )
 
     async def cmd_optimize(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Analyze server performance history and recommend dynamic optimizations."""
@@ -1440,15 +1817,13 @@ class SyamAdminBot:
                 f"\n\n⚙️ *Tindakan Optimasi Tersedia ({res.get('target_service')})*:\n"
                 f"• *Perintah*: `{res.get('optimization_command')}`\n"
                 f"• *Risiko*: {res.get('risk')}\n\n"
-                f"Kirim `/confirm {otp}` atau balas dengan `{otp}` untuk menerapkan optimasi ini."
+                f"{self._otp_line(otp)}"
             )
-            self._pending_confirmations[self.admin_id] = {
-                "action": "optimize_system",
-                "service": res.get("target_service"),
-                "command": res.get("optimization_command"),
-                "otp": otp,
-                "expires": datetime.now().timestamp() + 60,
-            }
+            self._arm_confirmation(
+                "optimize_system", otp, 60,
+                service=res.get("target_service"),
+                command=res.get("optimization_command"),
+            )
             
         await self._edit(msg,report_text, parse_mode="Markdown")
 
@@ -1469,43 +1844,46 @@ class SyamAdminBot:
             parse_mode="Markdown",
         )
 
-    async def cmd_security_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Display an AI security log scanner intelligence report."""
-        if not await self._guard(update):
-            return
+    async def _do_security_report(self, update: Update):
+        """Laporan intelijen keamanan dari scan log (AI)."""
         msg = await self._reply(update,"⏳ Menganalisis log keamanan server...")
         report = await self.modules["security"].scan_auth_logs(brain=self.modules["brain"])
         await self._edit(msg,report, parse_mode="Markdown")
 
-    async def cmd_harden_ssh_port(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Request shifting the SSH port to a non-standard port with dynamic OTP verification."""
-        if not await self._guard(update):
-            return
-        args = context.args or []
+    async def _do_ssh_port(self, update: Update, args: list):
+        """Ubah port SSH dengan verifikasi OTP."""
         if not args:
-            await self._reply(update,"❌ Format salah. Gunakan: `/harden_ssh_port <PORT_BARU>` (rentang 1024 - 65535)")
+            await self._reply(update,
+                "❌ Format salah. Gunakan: `/security ssh-port <PORT_BARU>` (rentang 1024 - 65535)",
+                parse_mode="Markdown")
             return
         try:
             new_port = int(args[0])
         except ValueError:
             await self._reply(update,"❌ Port harus berupa angka numerik valid.")
             return
-            
+
         otp = self._generate_otp()
         await self._reply(update,
             f"⚠️ *Konfirmasi Perubahan Port SSH* 🔐\n\n"
             f"Anda akan mengubah port SSH dari `{self.modules['security'].ssh_port}` menjadi `{new_port}`.\n"
             f"Tindakan ini sangat kritis dan membutuhkan otorisasi keamanan!\n\n"
-            f"Kirim `/confirm {otp}` atau cukup balas dengan `{otp}` untuk mengeksekusi.",
+            f"{self._otp_line(otp, 120)}",
             parse_mode="Markdown"
         )
-        
-        self._pending_confirmations[self.admin_id] = {
-            "action": "change_ssh_port",
-            "new_port": new_port,
-            "otp": otp,
-            "expires": datetime.now().timestamp() + 120,
-        }
+        self._arm_confirmation("change_ssh_port", otp, 120, new_port=new_port)
+
+    async def cmd_security_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias: /security report (kompatibilitas mundur)."""
+        if not await self._guard(update):
+            return
+        await self._do_security_report(update)
+
+    async def cmd_harden_ssh_port(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Alias: /security ssh-port <port> (kompatibilitas mundur)."""
+        if not await self._guard(update):
+            return
+        await self._do_ssh_port(update, context.args or [])
 
     async def cmd_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Panduan onboarding server untuk pemula."""
@@ -1711,6 +2089,64 @@ class SyamAdminBot:
             result = await self.modules["security"].change_ssh_port(new_port)
             await self._reply(update,result, parse_mode="Markdown")
 
+        elif action == "service_stop":
+            svc = pending["service"]
+            msg = await self._reply(update,f"🔧 Menghentikan layanan `{svc}`...", parse_mode="Markdown")
+            r = await self.modules["executor"].service_action(svc, "stop")
+            out = (r.get("stdout") or r.get("stderr") or "").strip()
+            icon = "✅" if r.get("success") else "❌"
+            await self._edit(msg,
+                f"{icon} *stop `{svc}`*\n```\n{out[:3000] or '(tidak ada output)'}\n```",
+                parse_mode="Markdown",
+            )
+
+        elif action == "apt_upgrade":
+            msg = await self._reply(update,"⬆️ Menjalankan update & upgrade paket... (bisa beberapa menit)")
+            r = await self.modules["executor"].run(
+                "DEBIAN_FRONTEND=noninteractive apt-get update && "
+                "DEBIAN_FRONTEND=noninteractive apt-get -y upgrade",
+                module="system", timeout=600, check=False,
+            )
+            out = (r.get("stdout") or r.get("stderr") or "").strip()
+            icon = "✅" if r.get("success") else "❌"
+            await self._edit(msg,
+                f"{icon} *Update & Upgrade Sistem*\n```\n{out[-3000:] or '(tidak ada output)'}\n```",
+                parse_mode="Markdown",
+            )
+
+        elif action == "reboot":
+            await self._reply(update,
+                "🔁 *Server akan reboot sekarang.*\nBot tidak merespons hingga server kembali online.",
+                parse_mode="Markdown",
+            )
+            await self.modules["executor"].run(
+                "systemctl reboot || shutdown -r now",
+                module="system", check=False,
+            )
+
+        elif action == "profile_reset":
+            self.modules["brain"].clear_profile()
+            await self._reply(update,
+                "🗑️ Profil dihapus. Ketik `/profile setup` untuk mengisi ulang.",
+                parse_mode="Markdown",
+            )
+
+        elif action == "app_update":
+            updater = self.modules.get("updater")
+            await self._reply(update,
+                "🚀 *Update SyamAdmin dimulai...*\n"
+                "Backup → unduh → ganti file → restart. Bot akan terputus sebentar; "
+                "hasil akhir dikirim otomatis setelah online kembali.\n"
+                "_Log: `/var/log/syamadmin/update.log`_",
+                parse_mode="Markdown",
+            )
+            res = await updater.trigger_update()
+            if not res.get("ok"):
+                await self._reply(update,
+                    f"❌ Gagal memicu updater: {res.get('error')}",
+                    parse_mode="Markdown",
+                )
+
         # ── PeFi actions ─────────────────────────────────────────────────
         elif action == "pefi_scan":
             pefi = self.modules.get("pefi")
@@ -1766,56 +2202,18 @@ class SyamAdminBot:
         self._app = Application.builder().token(self.token).build()
         app = self._app
 
-        # Register command handlers
-        app.add_handler(CommandHandler("start", self.cmd_start))
-        app.add_handler(CommandHandler("help", self.cmd_help))
-        app.add_handler(CommandHandler("status", self.cmd_status))
-        app.add_handler(CommandHandler("services", self.cmd_services))
-        app.add_handler(CommandHandler("provision", self.cmd_provision))
-        app.add_handler(CommandHandler("confirm", self.cmd_confirm))
-        app.add_handler(CommandHandler("site", self.cmd_site))
-        app.add_handler(CommandHandler("security", self.cmd_security))
-        app.add_handler(CommandHandler("harden", self.cmd_harden))
-        app.add_handler(CommandHandler("firewall", self.cmd_firewall))
-        app.add_handler(CommandHandler("fw", self.cmd_fw))
-        app.add_handler(CommandHandler("backup", self.cmd_backup))
-        app.add_handler(CommandHandler("logs", self.cmd_logs))
-        app.add_handler(CommandHandler("audit", self.cmd_audit))
-        app.add_handler(CommandHandler("ai", self.cmd_ai))
-        app.add_handler(CommandHandler("token", self.cmd_token))
-        app.add_handler(CommandHandler("model", self.cmd_model))
-        app.add_handler(CommandHandler("cron", self.cmd_cron))
-        app.add_handler(CommandHandler("optimize", self.cmd_optimize))
-        app.add_handler(CommandHandler("security_report", self.cmd_security_report))
-        app.add_handler(CommandHandler("harden_ssh_port", self.cmd_harden_ssh_port))
-        app.add_handler(CommandHandler("restore", self.cmd_restore))
-        app.add_handler(CommandHandler("setup", self.cmd_setup))
-        app.add_handler(CommandHandler("pefi", self.cmd_pefi))
+        # Register command handlers dari registry tunggal (anti-drift)
+        for _title, entries in COMMAND_REGISTRY:
+            for cmd, handler, *_rest in entries:
+                app.add_handler(CommandHandler(cmd, getattr(self, handler)))
+        for cmd, handler in COMMAND_ALIASES:
+            app.add_handler(CommandHandler(cmd, getattr(self, handler)))
 
         # Free-text handler (last)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
 
-        # Set bot commands menu
-        await app.bot.set_my_commands([
-            BotCommand("status", "Status server"),
-            BotCommand("services", "Status layanan"),
-            BotCommand("site", "Manage sites"),
-            BotCommand("security", "Security audit"),
-            BotCommand("security_report", "Laporan Keamanan AI"),
-            BotCommand("harden_ssh_port", "Ubah Port SSH Aman"),
-            BotCommand("firewall", "Status firewall"),
-            BotCommand("backup", "Backup management"),
-            BotCommand("logs", "Lihat log"),
-            BotCommand("ai", "AI command"),
-            BotCommand("token", "Statistik Token AI"),
-            BotCommand("model", "Lihat & ganti model AI"),
-            BotCommand("cron", "AI Task Scheduler"),
-            BotCommand("optimize", "AI Resource Optimizer"),
-            BotCommand("restore", "Restore dari backup"),
-            BotCommand("setup", "Panduan setup pemula"),
-            BotCommand("pefi", "Pre-Emptive Firewall AI"),
-            BotCommand("help", "Bantuan"),
-        ])
+        # Set bot commands menu (juga dari registry)
+        await app.bot.set_my_commands(_build_menu_commands())
 
         logger.info("Telegram bot started, polling for messages...")
 
