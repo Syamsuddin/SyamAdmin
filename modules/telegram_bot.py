@@ -116,6 +116,7 @@ HELP_TEXT = """
 `/pefi threats` — Ancaman aktif yang dipantau AI
 `/pefi rules` — Daftar IP yang diblokir PeFi
 `/pefi report [jam]` — Laporan aktivitas (default 24 jam)
+`/pefi health` — Health check: FP rate, baseline quality, cleanup stats
 `/pefi scan` — Trigger analisis manual sekarang (OTP)
 `/pefi block <ip> [jam]` — Blokir IP manual (OTP)
 `/pefi unblock <ip>` — Hapus blokir IP (OTP)
@@ -1232,6 +1233,11 @@ class SyamAdminBot:
             result = await pefi.get_report(hours=hours)
             await self._edit(msg, result, parse_mode="Markdown")
 
+        elif sub == "health":
+            msg = await self._reply(update, "🏥 Mengecek kesehatan sistem PeFi...")
+            result = await pefi.get_health()
+            await self._edit(msg, result, parse_mode="Markdown")
+
         # ── Perintah destructive/perubahan (wajib OTP) ──────────────────
         elif sub == "scan":
             otp = self._generate_otp()
@@ -1366,7 +1372,7 @@ class SyamAdminBot:
             await self._reply(
                 update,
                 "❓ Sub-command tidak dikenal.\n\n"
-                "Tersedia: `status` · `threats` · `rules` · `report` · `scan` · "
+                "Tersedia: `status` · `threats` · `rules` · `report` · `health` · `scan` · "
                 "`block` · `unblock` · `whitelist` · `ignore` · `autoblock`\n\n"
                 "Contoh: `/pefi threats` atau `/pefi block 1.2.3.4`",
                 parse_mode="Markdown",

@@ -114,6 +114,16 @@ class FirewallManager:
             return f"🚫 IP `{ip}` diblokir."
         return f"❌ Gagal: {r['stderr'][:300]}"
 
+    async def remove_deny_ip(self, ip: str) -> str:
+        """Hapus rule deny untuk IP tertentu dari UFW."""
+        r = await self.executor.run(
+            f"ufw delete deny from {ip} 2>/dev/null; echo done",
+            module="firewall", check=False,
+        )
+        if r["success"]:
+            return f"✅ Blokir `{ip}` dihapus dari UFW."
+        return f"❌ Gagal hapus blokir {ip}: {r['stderr'][:300]}"
+
     async def list_rules(self) -> str:
         """List all rules with numbers."""
         r = await self.executor.run("ufw status numbered", module="firewall")

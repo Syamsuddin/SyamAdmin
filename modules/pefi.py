@@ -783,6 +783,8 @@ class PreEmptiveFirewall:
             # Jika AI tidak aktif, tetap notif ancaman baru
             await self._notify_threats(new_high)
 
+        # Sprint 5: cleanup UFW rules yang expired
+        await self._cleanup_expired_rules()
         self._prune_old_data()
 
         logger.info(
@@ -984,6 +986,175 @@ class PreEmptiveFirewall:
         except Exception as e:
             logger.warning(f"PeFi notify error: {e}")
 
+    # ------------------------------------------------------------------
+    # SPRINT 5: HARDENING & TUNING
+    # ------------------------------------------------------------------
+
+    async def _seed_trusted_whitelist(self):
+        """
+        Seed IP server sendiri ke whitelist saat startup agar PeFi
+        tidak pernah self-block server atau koneksi admin yang aktif.
+        """
+        res = await self.executor.run(
+            "hostname -I 2>/dev/null || ip addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1",
+            module="pefi", check=False,
+        )
+        seeded = []
+        for ip in res.get("stdout", "").split():
+            ip = ip.strip()
+            if not ip or ip in self._whitelist_cache:
+                continue
+            try:
+                ipaddress.ip_address(ip)
+                conn = sqlite3.connect(self.db_path)
+                conn.execute(
+                    "INSERT OR IGNORE INTO pefi_whitelist (ip, reason, added_by) VALUES (?,?,?)",
+                    (ip, "Server own IP — auto-seeded on startup", "system"),
+                )
+                conn.commit()
+                conn.close()
+                self._whitelist_cache.add(ip)
+                seeded.append(ip)
+            except (ValueError, Exception):
+                pass
+        if seeded:
+            logger.info(f"PeFi: {len(seeded)} IP server di-seed ke whitelist: {seeded}")
+
+    async def _cleanup_expired_rules(self):
+        """
+        Hapus UFW rules yang sudah melewati TTL-nya.
+        Dipanggil setiap tick — idempoten dan aman dijalankan berulang.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            expired = conn.execute(
+                """SELECT ip FROM pefi_rules
+                   WHERE active=1 AND expires_at IS NOT NULL
+                     AND expires_at < datetime('now')"""
+            ).fetchall()
+            conn.close()
+
+            if not expired:
+                return
+
+            cleaned = []
+            for (ip,) in expired:
+                try:
+                    await self.firewall.remove_deny_ip(ip)
+                    cleaned.append(ip)
+                except Exception as e:
+                    logger.warning(f"PeFi: gagal hapus UFW rule {ip}: {e}")
+
+            if cleaned:
+                conn = sqlite3.connect(self.db_path)
+                placeholders = ",".join("?" * len(cleaned))
+                conn.execute(
+                    f"UPDATE pefi_rules SET active=0 WHERE ip IN ({placeholders}) AND active=1",
+                    cleaned,
+                )
+                conn.commit()
+                conn.close()
+                logger.info(f"PeFi: {len(cleaned)} expired rules dibersihkan: {cleaned}")
+                await self.notifier.send(
+                    f"🔓 *PeFi — Blokir Berakhir*\n\n"
+                    + "\n".join(f"• `{ip}` — TTL habis, akses dipulihkan" for ip in cleaned)
+                )
+        except Exception as e:
+            logger.warning(f"PeFi expired rules cleanup error: {e}")
+
+    async def _record_false_positive(self, ip: str):
+        """
+        Catat satu false positive untuk IP ini.
+        Jika jumlah FP >= PEFI_FP_AUTO_WHITELIST_COUNT dalam 30 hari,
+        IP di-auto-whitelist agar tidak diganggu PeFi lagi.
+        """
+        if not ip or self._is_trusted(ip):
+            return
+        fp_threshold = int(self.config.get("PEFI_FP_AUTO_WHITELIST_COUNT", 3))
+        try:
+            conn = sqlite3.connect(self.db_path)
+            fp_count = conn.execute(
+                """SELECT COUNT(*) FROM pefi_threats
+                   WHERE ip=? AND false_positive=1
+                     AND detected_at > datetime('now', '-30 days')""",
+                (ip,),
+            ).fetchone()[0]
+            conn.close()
+
+            if fp_count >= fp_threshold:
+                reason = f"Auto-whitelist: {fp_count} false positive dalam 30 hari"
+                await self.whitelist_ip(ip, reason=reason)
+                logger.info(f"PeFi: {ip} auto-whitelisted ({fp_count} FP)")
+                try:
+                    await self.notifier.send(
+                        f"🤍 *PeFi Auto-Whitelist*\n\n"
+                        f"• IP: `{ip}`\n"
+                        f"• Alasan: {reason}\n\n"
+                        f"_IP ini tidak akan diproses PeFi lagi._"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"PeFi FP record error untuk {ip}: {e}")
+
+    async def get_health(self) -> str:
+        """
+        Laporan kesehatan sistem PeFi: akurasi, baseline quality,
+        statistik cleanup, dan konfigurasi aktif.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            total_24h = conn.execute(
+                "SELECT COUNT(*) FROM pefi_threats WHERE detected_at > datetime('now','-24 hours')"
+            ).fetchone()[0]
+            fp_24h = conn.execute(
+                "SELECT COUNT(*) FROM pefi_threats "
+                "WHERE false_positive=1 AND detected_at > datetime('now','-24 hours')"
+            ).fetchone()[0]
+            blocked_24h = conn.execute(
+                "SELECT COUNT(*) FROM pefi_rules "
+                "WHERE active=1 AND created_at > datetime('now','-24 hours')"
+            ).fetchone()[0]
+            expired_24h = conn.execute(
+                "SELECT COUNT(*) FROM pefi_rules "
+                "WHERE active=0 AND expires_at IS NOT NULL "
+                "AND expires_at > datetime('now','-24 hours')"
+            ).fetchone()[0]
+            total_bl, good_bl = conn.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN sample_count>={self._baseline_min} THEN 1 ELSE 0 END) "
+                f"FROM pefi_baseline"
+            ).fetchone()
+            wl_total = conn.execute("SELECT COUNT(*) FROM pefi_whitelist").fetchone()[0]
+            wl_system = conn.execute(
+                "SELECT COUNT(*) FROM pefi_whitelist WHERE added_by='system'"
+            ).fetchone()[0]
+            conn.close()
+
+            fp_rate_str = f"{fp_24h/total_24h:.0%}" if total_24h else "—"
+            bl_str = f"{good_bl or 0}/{total_bl or 0} port ({self._baseline_min}+ sampel)"
+            st_icon = "🟢" if (self._running and self.enabled) else "🔴"
+            ab_icon = "🟢 ON" if self.config.get("PEFI_AUTO_BLOCK") == "true" else "🔴 OFF"
+
+            return (
+                f"🏥 *PeFi Health Check*\n\n"
+                f"• Status     : {st_icon} {'Aktif' if self.enabled else 'Nonaktif'}\n"
+                f"• Auto-block : {ab_icon}\n"
+                f"• Interval   : `{self.interval}s`\n\n"
+                f"*24 Jam Terakhir:*\n"
+                f"• Ancaman    : `{total_24h}` terdeteksi\n"
+                f"• FP rate    : `{fp_24h}` ({fp_rate_str})\n"
+                f"• Blokir baru: `{blocked_24h}`\n"
+                f"• Rule expired: `{expired_24h}`\n\n"
+                f"*Baseline Engine:*\n"
+                f"• Port stabil: `{bl_str}`\n\n"
+                f"*Whitelist:*\n"
+                f"• Total      : `{wl_total}` IP\n"
+                f"• System seed: `{wl_system}` IP\n"
+                f"• FP threshold: `{self.config.get('PEFI_FP_AUTO_WHITELIST_COUNT', 3)}` kali → auto-whitelist"
+            )
+        except Exception as e:
+            return f"❌ Gagal ambil health report: {e}"
+
     async def run_loop(self):
         """Background async task — parallel dengan bot & monitor."""
         if not self.enabled:
@@ -991,6 +1162,10 @@ class PreEmptiveFirewall:
             return
         self._running = True
         logger.info(f"🛡️ PeFi started (interval={self.interval}s)")
+
+        # Sprint 5: seed IP server sendiri ke whitelist sebelum mulai
+        await self._seed_trusted_whitelist()
+
         while self._running:
             try:
                 await self._tick()
@@ -1154,15 +1329,21 @@ class PreEmptiveFirewall:
             return f"❌ Error: {e}"
 
     async def ignore_threat(self, threat_id: int) -> str:
-        """Admin tandai ancaman sebagai false positive."""
+        """Admin tandai ancaman sebagai false positive + trigger feedback loop."""
         try:
             conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                "SELECT ip FROM pefi_threats WHERE id=?", (threat_id,)
+            ).fetchone()
             conn.execute(
                 "UPDATE pefi_threats SET action_taken='ignored', false_positive=1 WHERE id=?",
                 (threat_id,),
             )
             conn.commit()
             conn.close()
+            # Sprint 5: feedback loop — cek apakah perlu auto-whitelist
+            if row:
+                await self._record_false_positive(row[0])
             return f"✅ Ancaman ID `{threat_id}` ditandai sebagai false positive dan diabaikan."
         except Exception as e:
             return f"❌ Error: {e}"
