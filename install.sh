@@ -97,6 +97,9 @@ copy_files() {
     cp -r "${SCRIPT_DIR}/modules" "${INSTALL_DIR}/"
     cp -r "${SCRIPT_DIR}/templates" "${INSTALL_DIR}/"
     cp -r "${SCRIPT_DIR}/scripts" "${INSTALL_DIR}/"
+    # VERSION & requirements.txt dibutuhkan self-update (/update) + tampilan versi
+    cp -f "${SCRIPT_DIR}/VERSION" "${INSTALL_DIR}/" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/requirements.txt" "${INSTALL_DIR}/" 2>/dev/null || true
     chmod +x "${INSTALL_DIR}/scripts/"*.sh 2>/dev/null || true
 
     if [[ ! -f "${CONFIG_DIR}/config.env" ]]; then

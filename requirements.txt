@@ -1,0 +1,10 @@
+# Dependencies SyamAdmin — dipakai install.sh & self-updater (/update).
+python-telegram-bot==21.*
+anthropic==0.*
+aiohttp
+psutil
+aiosqlite
+python-dotenv
+jinja2
+croniter
+httpx
