@@ -15,9 +15,11 @@ import logging
 import math
 import re
 import sqlite3
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger("syamadmin.pefi")
@@ -27,6 +29,10 @@ _EMA_ALPHA = 0.15
 
 # Minimum sigma (standar deviasi) untuk hindari false positive saat traffic sangat tenang
 _MIN_STDDEV = 2.0
+
+# Format timestamp SQLite (UTC) — dipakai agar perbandingan string konsisten
+# dengan CURRENT_TIMESTAMP / datetime('now') tanpa f-string SQL.
+_SQLITE_TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 
 @dataclass
@@ -51,11 +57,12 @@ class PreEmptiveFirewall:
     ]
 
     def __init__(self, executor, firewall, brain, notifier,
-                 db_path: str, config: dict = None):
+                 db_path: str, config: dict = None, monitor=None):
         self.executor = executor
         self.firewall = firewall
         self.brain = brain
         self.notifier = notifier
+        self.monitor = monitor          # M-1: sumber konteks server real untuk AI
         self.db_path = db_path
         self.config = config or {}
         self._running = False
@@ -73,12 +80,65 @@ class PreEmptiveFirewall:
         self._thr_http_err   = int(self.config.get("PEFI_THRESHOLD_HTTP_ERRORS", 50))
         self._baseline_min   = int(self.config.get("PEFI_BASELINE_MIN_SAMPLES", 10))
 
+        # M-3: rate limit panggilan AI — serangan berkepanjangan tidak boleh
+        # memicu ribuan API call. Default: maksimal 1 analisis tiap 5 menit.
+        self._ai_cooldown = int(self.config.get("PEFI_AI_COOLDOWN", 300))
+        self._last_ai_call = 0.0
+
+        # M-4: cleanup UFW rules expired + prune hanya tiap N tick (bukan tiap tick),
+        # agar tidak men-spawn subprocess UFW setiap 60 detik.
+        self._cleanup_every = max(1, int(self.config.get("PEFI_CLEANUP_EVERY_TICKS", 10)))
+        self._tick_count = 0
+
+        # M-6: cooldown notifikasi per-IP agar admin tidak dibanjiri saat
+        # serangan berkelanjutan dari IP yang sama. Default 30 menit.
+        self._notif_cooldown_sec = int(self.config.get("PEFI_NOTIF_COOLDOWN", 1800))
+        self._notif_last: dict[str, float] = {}
+
         self._ensure_db()
         self._load_whitelist_cache()
 
     # ------------------------------------------------------------------
     # INISIALISASI
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def _db(self):
+        """
+        K-1/K-3: koneksi SQLite aman dipakai sebagai context manager —
+        busy_timeout (tahan lock konkuren), auto commit saat sukses,
+        rollback saat error, dan selalu close. WAL mode di-set sekali
+        global saat startup (lihat syamadmin.py).
+        """
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _cutoff(hours: int) -> str:
+        """K-2: batas waktu UTC (format SQLite) untuk query — hindari f-string SQL."""
+        return (datetime.now(timezone.utc) - timedelta(hours=int(hours))).strftime(_SQLITE_TS_FMT)
+
+    @staticmethod
+    def _future(hours: int) -> str:
+        """M-5: timestamp UTC masa depan (format SQLite) untuk expires_at."""
+        return (datetime.now(timezone.utc) + timedelta(hours=int(hours))).strftime(_SQLITE_TS_FMT)
+
+    def _should_notify(self, ip: str) -> bool:
+        """M-6: True bila IP ini belum dinotifikasi dalam periode cooldown."""
+        now = time.monotonic()
+        last = self._notif_last.get(ip, 0.0)
+        if now - last < self._notif_cooldown_sec:
+            return False
+        self._notif_last[ip] = now
+        return True
 
     def _build_trusted_nets(self) -> list:
         extra = self.config.get("PEFI_TRUSTED_NETWORKS", "")
@@ -103,91 +163,87 @@ class PreEmptiveFirewall:
     def _ensure_db(self):
         """Buat tabel PeFi di SQLite secara idempoten."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS pefi_ip_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ip TEXT NOT NULL,
-                    conn_count INTEGER DEFAULT 0,
-                    conn_syn INTEGER DEFAULT 0,
-                    ports_targeted TEXT DEFAULT '[]',
-                    port_count INTEGER DEFAULT 0,
-                    ssh_fail_count INTEGER DEFAULT 0,
-                    http_req_count INTEGER DEFAULT 0,
-                    http_error_count INTEGER DEFAULT 0,
-                    flags TEXT DEFAULT '{}'
-                );
-                CREATE INDEX IF NOT EXISTS idx_pefi_stats_ip
-                    ON pefi_ip_stats(ip);
-                CREATE INDEX IF NOT EXISTS idx_pefi_stats_ts
-                    ON pefi_ip_stats(timestamp);
+            with self._db() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS pefi_ip_stats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        ip TEXT NOT NULL,
+                        conn_count INTEGER DEFAULT 0,
+                        conn_syn INTEGER DEFAULT 0,
+                        ports_targeted TEXT DEFAULT '[]',
+                        port_count INTEGER DEFAULT 0,
+                        ssh_fail_count INTEGER DEFAULT 0,
+                        http_req_count INTEGER DEFAULT 0,
+                        http_error_count INTEGER DEFAULT 0,
+                        flags TEXT DEFAULT '{}'
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_pefi_stats_ip
+                        ON pefi_ip_stats(ip);
+                    CREATE INDEX IF NOT EXISTS idx_pefi_stats_ts
+                        ON pefi_ip_stats(timestamp);
 
-                CREATE TABLE IF NOT EXISTS pefi_baseline (
-                    port INTEGER NOT NULL,
-                    hour_of_day INTEGER NOT NULL,
-                    avg_conn_per_min REAL DEFAULT 0,
-                    m2_conn REAL DEFAULT 0,
-                    stddev_conn REAL DEFAULT 0,
-                    avg_unique_ips INTEGER DEFAULT 0,
-                    sample_count INTEGER DEFAULT 0,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (port, hour_of_day)
-                );
+                    CREATE TABLE IF NOT EXISTS pefi_baseline (
+                        port INTEGER NOT NULL,
+                        hour_of_day INTEGER NOT NULL,
+                        avg_conn_per_min REAL DEFAULT 0,
+                        m2_conn REAL DEFAULT 0,
+                        stddev_conn REAL DEFAULT 0,
+                        avg_unique_ips INTEGER DEFAULT 0,
+                        sample_count INTEGER DEFAULT 0,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (port, hour_of_day)
+                    );
 
-                CREATE TABLE IF NOT EXISTS pefi_threats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ip TEXT NOT NULL,
-                    threat_type TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    confidence REAL DEFAULT 0,
-                    ai_verdict TEXT,
-                    ai_reason TEXT,
-                    action_taken TEXT DEFAULT 'pending',
-                    resolved_at DATETIME,
-                    false_positive INTEGER DEFAULT 0,
-                    details TEXT DEFAULT '{}'
-                );
-                CREATE INDEX IF NOT EXISTS idx_pefi_threats_ip
-                    ON pefi_threats(ip);
+                    CREATE TABLE IF NOT EXISTS pefi_threats (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        detected_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        ip TEXT NOT NULL,
+                        threat_type TEXT NOT NULL,
+                        severity TEXT NOT NULL,
+                        confidence REAL DEFAULT 0,
+                        ai_verdict TEXT,
+                        ai_reason TEXT,
+                        action_taken TEXT DEFAULT 'pending',
+                        resolved_at DATETIME,
+                        false_positive INTEGER DEFAULT 0,
+                        details TEXT DEFAULT '{}'
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_pefi_threats_ip
+                        ON pefi_threats(ip);
 
-                CREATE TABLE IF NOT EXISTS pefi_rules (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    ip TEXT NOT NULL UNIQUE,
-                    rule_type TEXT NOT NULL,
-                    duration_hours INTEGER,
-                    expires_at DATETIME,
-                    reason TEXT,
-                    threat_id INTEGER,
-                    active INTEGER DEFAULT 1,
-                    FOREIGN KEY (threat_id) REFERENCES pefi_threats(id)
-                );
+                    CREATE TABLE IF NOT EXISTS pefi_rules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        ip TEXT NOT NULL UNIQUE,
+                        rule_type TEXT NOT NULL,
+                        duration_hours INTEGER,
+                        expires_at DATETIME,
+                        reason TEXT,
+                        threat_id INTEGER,
+                        active INTEGER DEFAULT 1,
+                        FOREIGN KEY (threat_id) REFERENCES pefi_threats(id)
+                    );
 
-                CREATE TABLE IF NOT EXISTS pefi_whitelist (
-                    ip TEXT PRIMARY KEY,
-                    added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    reason TEXT,
-                    added_by TEXT DEFAULT 'admin'
-                );
-            """)
-            conn.commit()
-            # Sprint 2 migration: tambah m2_conn ke baseline jika belum ada
-            cols = {r[1] for r in conn.execute("PRAGMA table_info(pefi_baseline)").fetchall()}
-            if "m2_conn" not in cols:
-                conn.execute("ALTER TABLE pefi_baseline ADD COLUMN m2_conn REAL DEFAULT 0")
-                conn.commit()
-            conn.close()
+                    CREATE TABLE IF NOT EXISTS pefi_whitelist (
+                        ip TEXT PRIMARY KEY,
+                        added_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        reason TEXT,
+                        added_by TEXT DEFAULT 'admin'
+                    );
+                """)
+                # Sprint 2 migration: tambah m2_conn ke baseline jika belum ada
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(pefi_baseline)").fetchall()}
+                if "m2_conn" not in cols:
+                    conn.execute("ALTER TABLE pefi_baseline ADD COLUMN m2_conn REAL DEFAULT 0")
             logger.info("PeFi: tabel DB siap.")
         except Exception as e:
             logger.error(f"PeFi DB init error: {e}")
 
     def _load_whitelist_cache(self):
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute("SELECT ip FROM pefi_whitelist").fetchall()
-            conn.close()
+            with self._db() as conn:
+                rows = conn.execute("SELECT ip FROM pefi_whitelist").fetchall()
             self._whitelist_cache = {r[0] for r in rows}
         except Exception:
             self._whitelist_cache = set()
@@ -382,45 +438,41 @@ class PreEmptiveFirewall:
         if not stats:
             return
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.executemany(
-                """INSERT INTO pefi_ip_stats
-                   (ip, conn_count, conn_syn, ports_targeted, port_count,
-                    ssh_fail_count, http_req_count, http_error_count, flags)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                [
-                    (
-                        s["ip"],
-                        s["conn_count"],
-                        s["conn_syn"],
-                        json.dumps(s["ports_targeted"]),
-                        s["port_count"],
-                        s["ssh_fail_count"],
-                        s["http_req_count"],
-                        s["http_error_count"],
-                        json.dumps(s.get("flags", {})),
-                    )
-                    for s in stats
-                ],
-            )
-            conn.commit()
-            conn.close()
+            with self._db() as conn:
+                conn.executemany(
+                    """INSERT INTO pefi_ip_stats
+                       (ip, conn_count, conn_syn, ports_targeted, port_count,
+                        ssh_fail_count, http_req_count, http_error_count, flags)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (
+                            s["ip"],
+                            s["conn_count"],
+                            s["conn_syn"],
+                            json.dumps(s["ports_targeted"]),
+                            s["port_count"],
+                            s["ssh_fail_count"],
+                            s["http_req_count"],
+                            s["http_error_count"],
+                            json.dumps(s.get("flags", {})),
+                        )
+                        for s in stats
+                    ],
+                )
         except Exception as e:
             logger.warning(f"PeFi: gagal simpan stats: {e}")
 
     def _prune_old_data(self):
         """Hapus data pefi_ip_stats lebih dari 7 hari & nonaktifkan rule expired."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute(
-                "DELETE FROM pefi_ip_stats WHERE timestamp < datetime('now', '-7 days')"
-            )
-            conn.execute(
-                """UPDATE pefi_rules SET active=0
-                   WHERE expires_at IS NOT NULL AND expires_at < datetime('now')"""
-            )
-            conn.commit()
-            conn.close()
+            with self._db() as conn:
+                conn.execute(
+                    "DELETE FROM pefi_ip_stats WHERE timestamp < datetime('now', '-7 days')"
+                )
+                conn.execute(
+                    """UPDATE pefi_rules SET active=0
+                       WHERE expires_at IS NOT NULL AND expires_at < datetime('now')"""
+                )
         except Exception as e:
             logger.warning(f"PeFi prune error: {e}")
 
@@ -454,43 +506,41 @@ class PreEmptiveFirewall:
             return
 
         try:
-            conn = sqlite3.connect(self.db_path)
-            for port, total_conn in port_conn.items():
-                row = conn.execute(
-                    "SELECT avg_conn_per_min, m2_conn, stddev_conn, avg_unique_ips, sample_count "
-                    "FROM pefi_baseline WHERE port=? AND hour_of_day=?",
-                    (port, hour),
-                ).fetchone()
+            with self._db() as conn:
+                for port, total_conn in port_conn.items():
+                    row = conn.execute(
+                        "SELECT avg_conn_per_min, m2_conn, stddev_conn, avg_unique_ips, sample_count "
+                        "FROM pefi_baseline WHERE port=? AND hour_of_day=?",
+                        (port, hour),
+                    ).fetchone()
 
-                if row is None:
-                    # Sampel pertama untuk port+jam ini
-                    conn.execute(
-                        """INSERT INTO pefi_baseline
-                           (port, hour_of_day, avg_conn_per_min, m2_conn, stddev_conn,
-                            avg_unique_ips, sample_count)
-                           VALUES (?,?,?,0,0,?,1)""",
-                        (port, hour, float(total_conn), len(port_ips[port])),
-                    )
-                else:
-                    old_avg, old_m2, _, old_unique, n = row
-                    n_new = n + 1
-                    # Welford's online algorithm
-                    delta = total_conn - old_avg
-                    new_avg = old_avg + delta / n_new
-                    delta2 = total_conn - new_avg
-                    new_m2 = old_m2 + delta * delta2
-                    new_stddev = math.sqrt(new_m2 / n_new) if n_new >= 2 else 0.0
-                    # EMA untuk unique IPs (tidak perlu presisi tinggi)
-                    new_unique = int((1 - _EMA_ALPHA) * old_unique + _EMA_ALPHA * len(port_ips[port]))
-                    conn.execute(
-                        """UPDATE pefi_baseline
-                           SET avg_conn_per_min=?, m2_conn=?, stddev_conn=?,
-                               avg_unique_ips=?, sample_count=?, updated_at=CURRENT_TIMESTAMP
-                           WHERE port=? AND hour_of_day=?""",
-                        (new_avg, new_m2, new_stddev, new_unique, n_new, port, hour),
-                    )
-            conn.commit()
-            conn.close()
+                    if row is None:
+                        # Sampel pertama untuk port+jam ini
+                        conn.execute(
+                            """INSERT INTO pefi_baseline
+                               (port, hour_of_day, avg_conn_per_min, m2_conn, stddev_conn,
+                                avg_unique_ips, sample_count)
+                               VALUES (?,?,?,0,0,?,1)""",
+                            (port, hour, float(total_conn), len(port_ips[port])),
+                        )
+                    else:
+                        old_avg, old_m2, _, old_unique, n = row
+                        n_new = n + 1
+                        # Welford's online algorithm
+                        delta = total_conn - old_avg
+                        new_avg = old_avg + delta / n_new
+                        delta2 = total_conn - new_avg
+                        new_m2 = old_m2 + delta * delta2
+                        new_stddev = math.sqrt(new_m2 / n_new) if n_new >= 2 else 0.0
+                        # EMA untuk unique IPs (tidak perlu presisi tinggi)
+                        new_unique = int((1 - _EMA_ALPHA) * old_unique + _EMA_ALPHA * len(port_ips[port]))
+                        conn.execute(
+                            """UPDATE pefi_baseline
+                               SET avg_conn_per_min=?, m2_conn=?, stddev_conn=?,
+                                   avg_unique_ips=?, sample_count=?, updated_at=CURRENT_TIMESTAMP
+                               WHERE port=? AND hour_of_day=?""",
+                            (new_avg, new_m2, new_stddev, new_unique, n_new, port, hour),
+                        )
         except Exception as e:
             logger.warning(f"PeFi baseline update error: {e}")
 
@@ -499,13 +549,12 @@ class PreEmptiveFirewall:
         hour = datetime.now(timezone.utc).hour
         result: dict[tuple, dict] = {}
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                "SELECT port, avg_conn_per_min, stddev_conn, sample_count "
-                "FROM pefi_baseline WHERE hour_of_day=?",
-                (hour,),
-            ).fetchall()
-            conn.close()
+            with self._db() as conn:
+                rows = conn.execute(
+                    "SELECT port, avg_conn_per_min, stddev_conn, sample_count "
+                    "FROM pefi_baseline WHERE hour_of_day=?",
+                    (hour,),
+                ).fetchall()
             for port, avg, stddev, n in rows:
                 result[(port, hour)] = {
                     "avg": avg,
@@ -651,12 +700,11 @@ class PreEmptiveFirewall:
     def _get_recidivist_ips(self) -> dict[str, int]:
         """Return dict {ip: jumlah_block_sebelumnya} untuk IP yang pernah diblokir PeFi."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                """SELECT ip, COUNT(*) as cnt FROM pefi_rules
-                   WHERE rule_type='block' GROUP BY ip HAVING cnt > 0"""
-            ).fetchall()
-            conn.close()
+            with self._db() as conn:
+                rows = conn.execute(
+                    """SELECT ip, COUNT(*) as cnt FROM pefi_rules
+                       WHERE rule_type='block' GROUP BY ip HAVING cnt > 0"""
+                ).fetchall()
             return {r[0]: r[1] for r in rows}
         except Exception:
             return {}
@@ -670,36 +718,33 @@ class PreEmptiveFirewall:
         if not threats:
             return
         try:
-            conn = sqlite3.connect(self.db_path)
             saved = 0
-            for t in threats:
-                # Cek duplikat dalam 60 menit
-                existing = conn.execute(
-                    """SELECT id, severity FROM pefi_threats
-                       WHERE ip=? AND threat_type=?
-                         AND detected_at > datetime('now', '-60 minutes')
-                         AND action_taken != 'resolved'
-                       ORDER BY detected_at DESC LIMIT 1""",
-                    (t.ip, t.threat_type),
-                ).fetchone()
+            with self._db() as conn:
+                for t in threats:
+                    # Cek duplikat dalam 60 menit
+                    existing = conn.execute(
+                        """SELECT id, severity FROM pefi_threats
+                           WHERE ip=? AND threat_type=?
+                             AND detected_at > datetime('now', '-60 minutes')
+                             AND action_taken != 'resolved'
+                           ORDER BY detected_at DESC LIMIT 1""",
+                        (t.ip, t.threat_type),
+                    ).fetchone()
 
-                severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
-                if existing:
-                    old_rank = severity_rank.get(existing[1], 0)
-                    new_rank = severity_rank.get(t.severity, 0)
-                    if new_rank <= old_rank:
-                        continue  # Sudah dilaporkan, severity tidak meningkat
+                    severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+                    if existing:
+                        old_rank = severity_rank.get(existing[1], 0)
+                        new_rank = severity_rank.get(t.severity, 0)
+                        if new_rank <= old_rank:
+                            continue  # Sudah dilaporkan, severity tidak meningkat
 
-                conn.execute(
-                    """INSERT INTO pefi_threats
-                       (ip, threat_type, severity, action_taken, details)
-                       VALUES (?,?,?,'pending',?)""",
-                    (t.ip, t.threat_type, t.severity, json.dumps(t.details)),
-                )
-                saved += 1
-
-            conn.commit()
-            conn.close()
+                    conn.execute(
+                        """INSERT INTO pefi_threats
+                           (ip, threat_type, severity, action_taken, details)
+                           VALUES (?,?,?,'pending',?)""",
+                        (t.ip, t.threat_type, t.severity, json.dumps(t.details)),
+                    )
+                    saved += 1
             if saved:
                 logger.info(f"PeFi: {saved} ancaman baru disimpan ke DB.")
         except Exception as e:
@@ -708,20 +753,19 @@ class PreEmptiveFirewall:
     def _get_pending_threats(self) -> list[dict]:
         """Ambil ancaman dengan status 'pending' untuk diproses (Sprint 3: AI analysis)."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                """SELECT id, ip, threat_type, severity, details
-                   FROM pefi_threats
-                   WHERE action_taken='pending'
-                     AND detected_at > datetime('now', '-30 minutes')
-                   ORDER BY
-                     CASE severity
-                       WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
-                       WHEN 'MEDIUM' THEN 3 ELSE 4 END,
-                     detected_at DESC
-                   LIMIT 20""",
-            ).fetchall()
-            conn.close()
+            with self._db() as conn:
+                rows = conn.execute(
+                    """SELECT id, ip, threat_type, severity, details
+                       FROM pefi_threats
+                       WHERE action_taken='pending'
+                         AND detected_at > datetime('now', '-30 minutes')
+                       ORDER BY
+                         CASE severity
+                           WHEN 'CRITICAL' THEN 1 WHEN 'HIGH' THEN 2
+                           WHEN 'MEDIUM' THEN 3 ELSE 4 END,
+                         detected_at DESC
+                       LIMIT 20""",
+                ).fetchall()
             return [
                 {
                     "id": r[0], "ip": r[1], "threat_type": r[2],
@@ -773,25 +817,31 @@ class PreEmptiveFirewall:
 
         new_high = [t for t in threats if t.severity in ("HIGH", "CRITICAL")]
 
-        # Layer 4 (AI): Analisis ancaman pending dengan Claude
+        # Layer 4 (AI): Analisis ancaman pending dengan Claude — dengan rate limit (M-3)
         pending = self._get_pending_threats()
-        if pending:
+        now = time.monotonic()
+        ai_used = False
+        if pending and (now - self._last_ai_call) >= self._ai_cooldown:
+            self._last_ai_call = now
+            ai_used = True
             decisions = await self._analyze_with_ai(pending)
             if decisions:
                 await self._apply_decisions(decisions)
         elif new_high:
-            # Jika AI tidak aktif, tetap notif ancaman baru
+            # AI dilewati (cooldown/nonaktif) → tetap beri tahu admin via rule-based
             await self._notify_threats(new_high)
 
-        # Sprint 5: cleanup UFW rules yang expired
-        await self._cleanup_expired_rules()
-        self._prune_old_data()
+        # M-4: cleanup UFW rules expired + prune hanya tiap N tick
+        self._tick_count += 1
+        if self._tick_count % self._cleanup_every == 0:
+            await self._cleanup_expired_rules()
+            self._prune_old_data()
 
         logger.info(
             f"PeFi tick: {len(aggregated)} IP dipantau, "
             f"{len(threats)} ancaman baru "
             f"({len(new_high)} HIGH/CRITICAL), "
-            f"{len(pending)} dianalisis AI"
+            f"{len(pending) if ai_used else 0} dianalisis AI"
         )
 
     # ------------------------------------------------------------------
@@ -818,11 +868,18 @@ class PreEmptiveFirewall:
                 for t in pending
             ]
 
-        # Ambil konteks server dari monitor jika tersedia
+        # M-1: ambil konteks server REAL dari monitor (fallback string statis)
         server_ctx = (
             "Layanan aktif: Nginx, MySQL, PHP-FPM, Fail2Ban, UFW, SSH. "
             "Port terbuka: 22, 80, 443."
         )
+        if self.monitor is not None:
+            try:
+                ctx = await self.monitor.get_state_context()
+                if ctx:
+                    server_ctx = ctx
+            except Exception as e:
+                logger.debug(f"PeFi: gagal ambil konteks monitor, pakai fallback: {e}")
 
         return await self.brain.analyze_pefi_threats(pending, server_ctx)
 
@@ -831,15 +888,13 @@ class PreEmptiveFirewall:
     ):
         """Update status keputusan AI di tabel pefi_threats."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute(
-                """UPDATE pefi_threats
-                   SET ai_verdict=?, confidence=?, ai_reason=?, action_taken=?
-                   WHERE id=?""",
-                (verdict, confidence, reason, action, threat_id),
-            )
-            conn.commit()
-            conn.close()
+            with self._db() as conn:
+                conn.execute(
+                    """UPDATE pefi_threats
+                       SET ai_verdict=?, confidence=?, ai_reason=?, action_taken=?
+                       WHERE id=?""",
+                    (verdict, confidence, reason, action, threat_id),
+                )
         except Exception as e:
             logger.warning(f"PeFi update threat status error: {e}")
 
@@ -851,21 +906,19 @@ class PreEmptiveFirewall:
             comment = f"PeFi auto-block: {reason[:80]}"
             await self.firewall.deny_ip(ip, comment=comment)
 
-            # Simpan ke pefi_rules
-            conn = sqlite3.connect(self.db_path)
-            expires_sql = (
-                f"datetime('now', '+{duration_hours} hours')"
+            # M-5: hitung expires_at di Python (parameterized) — tanpa f-string SQL
+            expires_at = (
+                self._future(duration_hours)
                 if duration_hours and duration_hours > 0
-                else "NULL"
+                else None
             )
-            conn.execute(
-                f"""INSERT OR REPLACE INTO pefi_rules
-                    (ip, rule_type, duration_hours, expires_at, reason, threat_id, active)
-                    VALUES (?,?,?,{expires_sql},?,?,1)""",
-                (ip, "block", duration_hours or None, reason[:200], threat_id),
-            )
-            conn.commit()
-            conn.close()
+            with self._db() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO pefi_rules
+                       (ip, rule_type, duration_hours, expires_at, reason, threat_id, active)
+                       VALUES (?,?,?,?,?,?,1)""",
+                    (ip, "block", duration_hours or None, expires_at, reason[:200], threat_id),
+                )
 
             dur_str = f"{duration_hours} jam" if duration_hours else "permanen"
             logger.info(f"PeFi auto-block: {ip} diblokir {dur_str} — {reason}")
@@ -937,22 +990,29 @@ class PreEmptiveFirewall:
                     threat_id, verdict, confidence, reason, "awaiting_confirm"
                 )
                 dur_str = f"{duration_h} jam" if duration_h else "permanen"
-                await self.notifier.send(
-                    f"⚠️ *PeFi — Konfirmasi Blokir*\n\n"
-                    f"• IP: `{ip}`\n"
-                    f"• Alasan: {reason}\n"
-                    f"• Durasi usulan: {dur_str}\n"
-                    f"• Keyakinan AI: {confidence:.0%}\n\n"
-                    f"Untuk memblokir: `/pefi block {ip}`\n"
-                    f"Untuk abaikan: `/pefi ignore {threat_id}`"
-                )
+                # M-6: hormati cooldown notifikasi per-IP agar tidak spam
+                notified = self._should_notify(ip)
+                if notified:
+                    await self.notifier.send(
+                        f"⚠️ *PeFi — Konfirmasi Blokir*\n\n"
+                        f"• IP: `{ip}`\n"
+                        f"• Alasan: {reason}\n"
+                        f"• Durasi usulan: {dur_str}\n"
+                        f"• Keyakinan AI: {confidence:.0%}\n\n"
+                        f"Untuk memblokir: `/pefi block {ip}`\n"
+                        f"Untuk abaikan: `/pefi ignore {threat_id}`"
+                    )
                 logger.info(
                     f"PeFi AWAITING: {ip} (conf={confidence:.2f}) — "
-                    f"notif dikirim ke admin"
+                    f"notif {'dikirim' if notified else 'ditahan (cooldown)'}"
                 )
 
     async def _notify_threats(self, threats: list[ThreatEvent]):
         """Kirim ringkasan ancaman HIGH/CRITICAL ke Telegram admin."""
+        if not threats:
+            return
+        # M-6: hormati cooldown notifikasi per-IP
+        threats = [t for t in threats if self._should_notify(t.ip)]
         if not threats:
             return
         icons = {"CRITICAL": "💀", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵"}
@@ -999,40 +1059,43 @@ class PreEmptiveFirewall:
             "hostname -I 2>/dev/null || ip addr show | grep 'inet ' | awk '{print $2}' | cut -d/ -f1",
             module="pefi", check=False,
         )
-        seeded = []
+        candidates = []
         for ip in res.get("stdout", "").split():
             ip = ip.strip()
             if not ip or ip in self._whitelist_cache:
                 continue
             try:
                 ipaddress.ip_address(ip)
-                conn = sqlite3.connect(self.db_path)
-                conn.execute(
-                    "INSERT OR IGNORE INTO pefi_whitelist (ip, reason, added_by) VALUES (?,?,?)",
-                    (ip, "Server own IP — auto-seeded on startup", "system"),
-                )
-                conn.commit()
-                conn.close()
-                self._whitelist_cache.add(ip)
-                seeded.append(ip)
-            except (ValueError, Exception):
+                candidates.append(ip)
+            except ValueError:
                 pass
-        if seeded:
-            logger.info(f"PeFi: {len(seeded)} IP server di-seed ke whitelist: {seeded}")
+
+        if not candidates:
+            return
+        try:
+            with self._db() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO pefi_whitelist (ip, reason, added_by) VALUES (?,?,?)",
+                    [(ip, "Server own IP — auto-seeded on startup", "system") for ip in candidates],
+                )
+            for ip in candidates:
+                self._whitelist_cache.add(ip)
+            logger.info(f"PeFi: {len(candidates)} IP server di-seed ke whitelist: {candidates}")
+        except Exception as e:
+            logger.warning(f"PeFi seed whitelist error: {e}")
 
     async def _cleanup_expired_rules(self):
         """
         Hapus UFW rules yang sudah melewati TTL-nya.
-        Dipanggil setiap tick — idempoten dan aman dijalankan berulang.
+        Dipanggil tiap N tick (M-4) — idempoten dan aman dijalankan berulang.
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            expired = conn.execute(
-                """SELECT ip FROM pefi_rules
-                   WHERE active=1 AND expires_at IS NOT NULL
-                     AND expires_at < datetime('now')"""
-            ).fetchall()
-            conn.close()
+            with self._db() as conn:
+                expired = conn.execute(
+                    """SELECT ip FROM pefi_rules
+                       WHERE active=1 AND expires_at IS NOT NULL
+                         AND expires_at < datetime('now')"""
+                ).fetchall()
 
             if not expired:
                 return
@@ -1046,14 +1109,12 @@ class PreEmptiveFirewall:
                     logger.warning(f"PeFi: gagal hapus UFW rule {ip}: {e}")
 
             if cleaned:
-                conn = sqlite3.connect(self.db_path)
-                placeholders = ",".join("?" * len(cleaned))
-                conn.execute(
-                    f"UPDATE pefi_rules SET active=0 WHERE ip IN ({placeholders}) AND active=1",
-                    cleaned,
-                )
-                conn.commit()
-                conn.close()
+                with self._db() as conn:
+                    placeholders = ",".join("?" * len(cleaned))
+                    conn.execute(
+                        f"UPDATE pefi_rules SET active=0 WHERE ip IN ({placeholders}) AND active=1",
+                        cleaned,
+                    )
                 logger.info(f"PeFi: {len(cleaned)} expired rules dibersihkan: {cleaned}")
                 await self.notifier.send(
                     f"🔓 *PeFi — Blokir Berakhir*\n\n"
@@ -1072,14 +1133,13 @@ class PreEmptiveFirewall:
             return
         fp_threshold = int(self.config.get("PEFI_FP_AUTO_WHITELIST_COUNT", 3))
         try:
-            conn = sqlite3.connect(self.db_path)
-            fp_count = conn.execute(
-                """SELECT COUNT(*) FROM pefi_threats
-                   WHERE ip=? AND false_positive=1
-                     AND detected_at > datetime('now', '-30 days')""",
-                (ip,),
-            ).fetchone()[0]
-            conn.close()
+            with self._db() as conn:
+                fp_count = conn.execute(
+                    """SELECT COUNT(*) FROM pefi_threats
+                       WHERE ip=? AND false_positive=1
+                         AND detected_at > datetime('now', '-30 days')""",
+                    (ip,),
+                ).fetchone()[0]
 
             if fp_count >= fp_threshold:
                 reason = f"Auto-whitelist: {fp_count} false positive dalam 30 hari"
@@ -1103,32 +1163,32 @@ class PreEmptiveFirewall:
         statistik cleanup, dan konfigurasi aktif.
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            total_24h = conn.execute(
-                "SELECT COUNT(*) FROM pefi_threats WHERE detected_at > datetime('now','-24 hours')"
-            ).fetchone()[0]
-            fp_24h = conn.execute(
-                "SELECT COUNT(*) FROM pefi_threats "
-                "WHERE false_positive=1 AND detected_at > datetime('now','-24 hours')"
-            ).fetchone()[0]
-            blocked_24h = conn.execute(
-                "SELECT COUNT(*) FROM pefi_rules "
-                "WHERE active=1 AND created_at > datetime('now','-24 hours')"
-            ).fetchone()[0]
-            expired_24h = conn.execute(
-                "SELECT COUNT(*) FROM pefi_rules "
-                "WHERE active=0 AND expires_at IS NOT NULL "
-                "AND expires_at > datetime('now','-24 hours')"
-            ).fetchone()[0]
-            total_bl, good_bl = conn.execute(
-                f"SELECT COUNT(*), SUM(CASE WHEN sample_count>={self._baseline_min} THEN 1 ELSE 0 END) "
-                f"FROM pefi_baseline"
-            ).fetchone()
-            wl_total = conn.execute("SELECT COUNT(*) FROM pefi_whitelist").fetchone()[0]
-            wl_system = conn.execute(
-                "SELECT COUNT(*) FROM pefi_whitelist WHERE added_by='system'"
-            ).fetchone()[0]
-            conn.close()
+            with self._db() as conn:
+                total_24h = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_threats WHERE detected_at > datetime('now','-24 hours')"
+                ).fetchone()[0]
+                fp_24h = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_threats "
+                    "WHERE false_positive=1 AND detected_at > datetime('now','-24 hours')"
+                ).fetchone()[0]
+                blocked_24h = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_rules "
+                    "WHERE active=1 AND created_at > datetime('now','-24 hours')"
+                ).fetchone()[0]
+                expired_24h = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_rules "
+                    "WHERE active=0 AND expires_at IS NOT NULL "
+                    "AND expires_at > datetime('now','-24 hours')"
+                ).fetchone()[0]
+                total_bl, good_bl = conn.execute(
+                    "SELECT COUNT(*), SUM(CASE WHEN sample_count>=? THEN 1 ELSE 0 END) "
+                    "FROM pefi_baseline",
+                    (self._baseline_min,),
+                ).fetchone()
+                wl_total = conn.execute("SELECT COUNT(*) FROM pefi_whitelist").fetchone()[0]
+                wl_system = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_whitelist WHERE added_by='system'"
+                ).fetchone()[0]
 
             fp_rate_str = f"{fp_24h/total_24h:.0%}" if total_24h else "—"
             bl_str = f"{good_bl or 0}/{total_bl or 0} port ({self._baseline_min}+ sampel)"
@@ -1182,21 +1242,20 @@ class PreEmptiveFirewall:
 
     async def get_status(self) -> str:
         try:
-            conn = sqlite3.connect(self.db_path)
-            threats_24h = conn.execute(
-                "SELECT COUNT(*) FROM pefi_threats WHERE detected_at > datetime('now','-24 hours')"
-            ).fetchone()[0]
-            active_rules = conn.execute(
-                "SELECT COUNT(*) FROM pefi_rules WHERE active=1"
-            ).fetchone()[0]
-            whitelisted = conn.execute(
-                "SELECT COUNT(*) FROM pefi_whitelist"
-            ).fetchone()[0]
-            ip_1h, last_scan = conn.execute(
-                "SELECT COUNT(DISTINCT ip), MAX(timestamp) FROM pefi_ip_stats "
-                "WHERE timestamp > datetime('now','-1 hour')"
-            ).fetchone()
-            conn.close()
+            with self._db() as conn:
+                threats_24h = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_threats WHERE detected_at > datetime('now','-24 hours')"
+                ).fetchone()[0]
+                active_rules = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_rules WHERE active=1"
+                ).fetchone()[0]
+                whitelisted = conn.execute(
+                    "SELECT COUNT(*) FROM pefi_whitelist"
+                ).fetchone()[0]
+                ip_1h, last_scan = conn.execute(
+                    "SELECT COUNT(DISTINCT ip), MAX(timestamp) FROM pefi_ip_stats "
+                    "WHERE timestamp > datetime('now','-1 hour')"
+                ).fetchone()
 
             status_icon = "🟢" if (self._running and self.enabled) else "🔴"
             status_text = "Aktif" if (self._running and self.enabled) else "Nonaktif"
@@ -1216,14 +1275,13 @@ class PreEmptiveFirewall:
 
     async def get_active_threats(self) -> str:
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                """SELECT ip, threat_type, severity, action_taken, detected_at
-                   FROM pefi_threats
-                   WHERE detected_at > datetime('now','-24 hours')
-                   ORDER BY detected_at DESC LIMIT 15"""
-            ).fetchall()
-            conn.close()
+            with self._db() as conn:
+                rows = conn.execute(
+                    """SELECT ip, threat_type, severity, action_taken, detected_at
+                       FROM pefi_threats
+                       WHERE detected_at > datetime('now','-24 hours')
+                       ORDER BY detected_at DESC LIMIT 15"""
+                ).fetchall()
 
             if not rows:
                 return "✅ Tidak ada ancaman terdeteksi dalam 24 jam terakhir."
@@ -1240,13 +1298,12 @@ class PreEmptiveFirewall:
 
     async def get_active_rules(self) -> str:
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                """SELECT ip, rule_type, reason, created_at, expires_at
-                   FROM pefi_rules WHERE active=1
-                   ORDER BY created_at DESC LIMIT 20"""
-            ).fetchall()
-            conn.close()
+            with self._db() as conn:
+                rows = conn.execute(
+                    """SELECT ip, rule_type, reason, created_at, expires_at
+                       FROM pefi_rules WHERE active=1
+                       ORDER BY created_at DESC LIMIT 20"""
+                ).fetchall()
 
             if not rows:
                 return "✅ Tidak ada aturan PeFi aktif saat ini."
@@ -1260,13 +1317,11 @@ class PreEmptiveFirewall:
 
     async def whitelist_ip(self, ip: str, reason: str = "manual oleh admin") -> str:
         try:
-            conn = sqlite3.connect(self.db_path)
-            conn.execute(
-                "INSERT OR REPLACE INTO pefi_whitelist (ip, reason, added_by) VALUES (?,?,?)",
-                (ip, reason, "admin"),
-            )
-            conn.commit()
-            conn.close()
+            with self._db() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO pefi_whitelist (ip, reason, added_by) VALUES (?,?,?)",
+                    (ip, reason, "admin"),
+                )
             self._whitelist_cache.add(ip)
             return (
                 f"✅ `{ip}` ditambahkan ke whitelist PeFi.\n"
@@ -1277,15 +1332,13 @@ class PreEmptiveFirewall:
 
     async def remove_rule(self, ip: str) -> str:
         try:
-            conn = sqlite3.connect(self.db_path)
-            affected = conn.execute(
-                "SELECT id FROM pefi_rules WHERE ip=? AND active=1", (ip,)
-            ).fetchall()
-            conn.execute(
-                "UPDATE pefi_rules SET active=0 WHERE ip=? AND active=1", (ip,)
-            )
-            conn.commit()
-            conn.close()
+            with self._db() as conn:
+                affected = conn.execute(
+                    "SELECT id FROM pefi_rules WHERE ip=? AND active=1", (ip,)
+                ).fetchall()
+                conn.execute(
+                    "UPDATE pefi_rules SET active=0 WHERE ip=? AND active=1", (ip,)
+                )
             if not affected:
                 return f"ℹ️ Tidak ada aturan aktif PeFi untuk `{ip}`."
             await self.firewall.allow_ip(ip, comment="PeFi unblock by admin")
@@ -1303,14 +1356,13 @@ class PreEmptiveFirewall:
     async def approve_block(self, ip: str, duration_hours: int = 24) -> str:
         """Admin konfirmasi blokir IP yang sedang awaiting_confirm."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            threat = conn.execute(
-                """SELECT id, ai_reason FROM pefi_threats
-                   WHERE ip=? AND action_taken='awaiting_confirm'
-                   ORDER BY detected_at DESC LIMIT 1""",
-                (ip,),
-            ).fetchone()
-            conn.close()
+            with self._db() as conn:
+                threat = conn.execute(
+                    """SELECT id, ai_reason FROM pefi_threats
+                       WHERE ip=? AND action_taken='awaiting_confirm'
+                       ORDER BY detected_at DESC LIMIT 1""",
+                    (ip,),
+                ).fetchone()
             if not threat:
                 return f"ℹ️ Tidak ada ancaman pending untuk IP `{ip}`."
             threat_id, reason = threat
@@ -1331,16 +1383,14 @@ class PreEmptiveFirewall:
     async def ignore_threat(self, threat_id: int) -> str:
         """Admin tandai ancaman sebagai false positive + trigger feedback loop."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            row = conn.execute(
-                "SELECT ip FROM pefi_threats WHERE id=?", (threat_id,)
-            ).fetchone()
-            conn.execute(
-                "UPDATE pefi_threats SET action_taken='ignored', false_positive=1 WHERE id=?",
-                (threat_id,),
-            )
-            conn.commit()
-            conn.close()
+            with self._db() as conn:
+                row = conn.execute(
+                    "SELECT ip FROM pefi_threats WHERE id=?", (threat_id,)
+                ).fetchone()
+                conn.execute(
+                    "UPDATE pefi_threats SET action_taken='ignored', false_positive=1 WHERE id=?",
+                    (threat_id,),
+                )
             # Sprint 5: feedback loop — cek apakah perlu auto-whitelist
             if row:
                 await self._record_false_positive(row[0])
@@ -1351,19 +1401,21 @@ class PreEmptiveFirewall:
     async def get_report(self, hours: int = 24) -> str:
         """Laporan ringkasan aktivitas PeFi dalam N jam terakhir."""
         try:
-            conn = sqlite3.connect(self.db_path)
-            rows = conn.execute(
-                f"""SELECT threat_type, severity, action_taken, COUNT(*) as n
-                    FROM pefi_threats
-                    WHERE detected_at > datetime('now', '-{hours} hours')
-                    GROUP BY threat_type, severity, action_taken
-                    ORDER BY n DESC""",
-            ).fetchall()
-            blocked = conn.execute(
-                f"""SELECT COUNT(*) FROM pefi_rules
-                    WHERE active=1 AND created_at > datetime('now', '-{hours} hours')"""
-            ).fetchone()[0]
-            conn.close()
+            cutoff = self._cutoff(hours)  # K-2: parameterized, bukan f-string SQL
+            with self._db() as conn:
+                rows = conn.execute(
+                    """SELECT threat_type, severity, action_taken, COUNT(*) as n
+                       FROM pefi_threats
+                       WHERE detected_at > ?
+                       GROUP BY threat_type, severity, action_taken
+                       ORDER BY n DESC""",
+                    (cutoff,),
+                ).fetchall()
+                blocked = conn.execute(
+                    """SELECT COUNT(*) FROM pefi_rules
+                       WHERE active=1 AND created_at > ?""",
+                    (cutoff,),
+                ).fetchone()[0]
             if not rows:
                 return f"✅ Tidak ada aktivitas PeFi dalam {hours} jam terakhir."
             icons = {"CRITICAL": "💀", "HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🔵"}
