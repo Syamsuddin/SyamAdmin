@@ -34,7 +34,7 @@ class TestUpdater(unittest.TestCase):
     def test_local_version_missing_default(self):
         os.remove(os.path.join(self.dir, "VERSION"))
         up = Updater(self.ex, config={"INSTALL_DIR": self.dir})
-        # fallback ke VERSION root paket (ada 3.1.0) atau 0.0.0 — keduanya valid string
+        # fallback ke VERSION root paket (mis. 3.2.0) atau 0.0.0 — keduanya valid string
         self.assertRegex(up.get_local_version(), r"^\d+\.\d+")
 
     def test_parse_and_compare(self):

@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>SyamAdmin v3.0 — AI-powered sysadmin agent for Ubuntu 22.04/24.04 LTS VPS, controlled entirely via Telegram.</strong><br>
+  <strong>SyamAdmin v3.2 — AI-powered sysadmin agent for Ubuntu 22.04/24.04 LTS VPS, controlled entirely via Telegram.</strong><br>
   <sub>From zero configuration to secured production-ready LEMP stack and continuous autopilot maintenance.</sub>
 </p>
 
@@ -21,7 +21,7 @@
 
 **SyamAdmin** adalah agen sysadmin kecerdasan buatan (*AI sysadmin agent*) mandiri yang berjalan sebagai daemon di latar belakang Ubuntu VPS Anda. SyamAdmin mengotomatiskan pengelolaan server dari instalasi bersih kosong hingga menjadi server produksi hosting LEMP stack yang terkonfigurasi optimal, ter-hardening, dan terpantau 24/7 — dikendalikan seluruhnya melalui chat bot Telegram yang ramah.
 
-Dengan versi **v3.0 Memory Core & Autopilot**, admin awam maupun pemula dapat berinteraksi dengan server dalam bahasa alami (Indonesia/Inggris). AI kini ber-**memori** (mengingat preferensi, riwayat percakapan, dan pelajaran insiden), mampu menyusun & menjalankan **rencana multi-langkah** dari satu kalimat, mendiagnosis kegagalan secara mandiri, merekomendasikan optimasi, menjadwalkan tugas berkala, memandu setup website interaktif, dan melindungi seluruh tindakan kritis lewat **Central OTP Confirmation Flow**. Seluruh keputusan AI memakai **native tool-use** Anthropic (output terstruktur terjamin) dengan model default **Claude Haiku 4.5**.
+Dengan versi **v3.2 Memory Core, Autopilot & Pre-Emptive Firewall**, admin awam maupun pemula dapat berinteraksi dengan server dalam bahasa alami (Indonesia/Inggris). AI kini ber-**memori** (mengingat preferensi, riwayat percakapan, dan pelajaran insiden), mampu menyusun & menjalankan **rencana multi-langkah** dari satu kalimat, mendiagnosis kegagalan secara mandiri, merekomendasikan optimasi, menjadwalkan tugas berkala, memandu setup website interaktif, memblokir serangan secara **pre-emptive (PeFi)**, dan melindungi seluruh tindakan kritis lewat **Central OTP Confirmation Flow**. Seluruh keputusan AI memakai **native tool-use** Anthropic (output terstruktur terjamin) dengan model default **Claude Haiku 4.5**.
 
 ```
 You:  /provision
@@ -53,7 +53,7 @@ Bot:  🔄 Autopilot — Rencana Kerja
 
 ---
 
-## 🧠 Fitur Cerdas Unggulan (Advanced Smart AI Features v3.0)
+## 🧠 Fitur Cerdas Unggulan (Advanced Smart AI Features v3.2)
 
 > [!NOTE]
 > Seluruh fitur baru dirancang dengan keamanan mutlak dan kemudahan operasional maksimal bagi pengguna yang tidak memiliki latar belakang keahlian teknis Linux (layperson).
@@ -365,7 +365,7 @@ notifikasi startup, dan `/update`.
 
 ## 📱 Telegram Commands Reference
 
-### 🤖 Fitur Cerdas (AI & Advanced v3.0)
+### 🤖 Fitur Cerdas (AI & Advanced v3.2)
 
 | Command | Deskripsi | Protokol Keamanan |
 |---------|-------------|-------------------|
@@ -444,7 +444,7 @@ notifikasi startup, dan `/update`.
 
 ---
 
-## 📊 Feature Inventory v3.1 — 30 Commands Across 13 Modules
+## 📊 Feature Inventory v3.2 — 30 Commands Across 13 Modules
 
 ### Sistem Inti (6 commands)
 

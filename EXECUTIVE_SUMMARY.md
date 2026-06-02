@@ -18,7 +18,7 @@ Mengelola server Linux adalah pekerjaan teknis, mahal, dan berisiko tinggi:
 
 ---
 
-## Solusi: SyamAdmin v3.0 — Memory Core + AI Autopilot + Self-Update
+## Solusi: SyamAdmin v3.2 — Memory Core + AI Autopilot + Pre-Emptive Firewall + Self-Update
 
 **SyamAdmin** = daemon Python yang berjalan di `/opt/syamadmin` di VPS Ubuntu Anda, dikendalikan **sepenuhnya via Telegram**, **dalam Bahasa Indonesia**. Tidak ada dashboard web. Tidak perlu SSH. Tidak perlu terminal.
 
@@ -69,7 +69,7 @@ Tidak perlu menghubungi admin atau restart manual. Deploy update dalam seketika 
 
 ---
 
-## Fitur Unggulan (v3.1)
+## Fitur Unggulan (v3.2)
 
 ### Manajemen Server Inti
 
@@ -80,7 +80,7 @@ Tidak perlu menghubungi admin atau restart manual. Deploy update dalam seketika 
 | **`/service <action> <name>`** | Direct systemctl control: restart/start/stop/reload/status (stop butuh OTP) |
 | **`/logs [layanan] [baris]`** | Read N tail lines (default 30, max 200) dari: nginx/nginx-access/mysql/auth/syslog/fail2ban/syamadmin |
 | **`/audit`** | Riwayat 15 shell command terbaru (module, action, status, waktu) |
-| **`/update check`** | Cek versi terbaru di GitHub (v3.1.0 vs v3.2.0?) |
+| **`/update check`** | Cek versi terbaru di GitHub (mis. v3.2.0 vs v3.3.0?) |
 | **`/update now`** | Pull & install dari GitHub + backup + auto-rollback (OTP) |
 | **`/sysupdate`** | `apt-get update && upgrade -y` (OTP) |
 | **`/reboot`** | Restart server (OTP) |
@@ -219,7 +219,7 @@ ROI: Positif sejak hari ke-2
 
 ## Roadmap & Visi
 
-**v3.1 (Saat ini)**
+**v3.2 (Saat ini)**
 - ✅ Core LEMP provisioning & site management
 - ✅ OTP dual-layer security model
 - ✅ Memory Core (4 pilar: audit, prefs, history, long-term lessons)
@@ -228,7 +228,7 @@ ROI: Positif sejak hari ke-2
 - ✅ Profil admin + konteks waktu sistem
 - ✅ 30+ slash commands (registry-driven, konsisten)
 
-**v3.2 (Rencana)**
+**v3.3 (Rencana)**
 - [ ] Multi-server management (orchestrate 5+ VPS dari satu chat)
 - [ ] Backup cloud integration (S3, Google Cloud Storage)
 - [ ] Database snapshot management (MySQL point-in-time recovery)
